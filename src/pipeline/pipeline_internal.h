@@ -29,6 +29,25 @@
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
 
+/* Router mounts (`app.use("/org", middleware, orgRoutes)`).  Both the parallel
+ * and the sequential call pass see mounts, and neither classifies them — a
+ * mount matches no service pattern and carries no verb suffix — so the
+ * extractor is shared rather than duplicated.  Emits one MOUNTS edge per router
+ * argument; cbm_pipeline_apply_router_mounts later turns those into full paths. */
+bool cbm_pipeline_is_router_mount(const char *callee_name);
+
+/* True when a verb-suffixed path call registers a route rather than calling
+ * one.  Registration is asserted, never assumed: a router-shaped receiver, or a
+ * handler argument.  Anything else with a path is a client call. */
+bool cbm_pipeline_is_route_registration(const CBMCall *call, const cbm_registry_t *registry,
+                                        const cbm_gbuf_t *gbuf, const char *module_qn,
+                                        const char **imp_keys, const char **imp_vals,
+                                        int imp_count);
+void cbm_pipeline_emit_router_mount(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                    const CBMCall *call, const char *module_qn,
+                                    const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
+                                    const char **imp_keys, const char **imp_vals, int imp_count);
+
 /* Incremental integrity failure: abort the run and preserve the existing DB.
  * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
  * "no incremental route; continue with a full index" sentinel. */

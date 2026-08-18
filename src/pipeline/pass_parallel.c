@@ -1546,6 +1546,310 @@ static bool is_path_keyword(const char *keyword) {
     return false;
 }
 
+/* Defined below with the URL helpers; needed here to validate a mount path. */
+static bool is_junk_url(const char *s);
+
+/* ── Express router mounts ────────────────────────────────────────
+ *
+ * `app.use("/org", authMiddleware, orgRoutes)` is what gives a router's routes
+ * their real path.  Without it every route in orgRoutes.js is recorded as the
+ * fragment the file declares ("/accounts"), which no caller can ever match: the
+ * client asks for "/org/accounts".  The mount is a plain call, so it is
+ * captured here and resolved into full paths by the route-node pass, which is
+ * the first point where both the mount and the mounted file are in one graph.
+ *
+ * Real mounts are template literals whose head is an environment-dependent
+ * prefix variable (`\u0060${prefix}/org\u0060`).  That leading substitution is
+ * dropped rather than canonicalised: turning it into a wildcard segment would
+ * produce "/{}/org/accounts" and match nothing. */
+/* Receiver of a member call: the text before the final dot. */
+static const char *callee_receiver_tail(const char *callee_name, char *buf, size_t buf_sz) {
+    if (!callee_name) {
+        return "";
+    }
+    const char *dot = strrchr(callee_name, '.');
+    if (!dot) {
+        return "";
+    }
+    size_t len = (size_t)(dot - callee_name);
+    const char *start = callee_name;
+    for (size_t i = 0; i < len; i++) {
+        if (callee_name[i] == '.') {
+            start = callee_name + i + SKIP_ONE;
+        }
+    }
+    len = (size_t)(dot - start);
+    if (len >= buf_sz) {
+        len = buf_sz - SKIP_ONE;
+    }
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static bool receiver_is_router_like(const char *tail) {
+    if (!tail || !tail[0]) {
+        return false;
+    }
+    if (strcmp(tail, "app") == 0 || strcmp(tail, "server") == 0 || strcmp(tail, "r") == 0 ||
+        strcmp(tail, "Route") == 0 || strcmp(tail, "route") == 0 ||
+        strcmp(tail, "fastify") == 0 || strcmp(tail, "mux") == 0) {
+        return true;
+    }
+    size_t len = strlen(tail);
+    const char *suffixes[] = {"router", "Router", "routes", "Routes", NULL};
+    for (int i = 0; suffixes[i]; i++) {
+        size_t sl = strlen(suffixes[i]);
+        if (len >= sl && strcmp(tail + len - sl, suffixes[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An inline handler (`(req, res) => ...`, `function (req, res) {}`, or an
+ * `async` form) only ever appears in a registration. */
+static bool arg_is_inline_function(const char *expr) {
+    if (!expr || !expr[0]) {
+        return false;
+    }
+    if (strstr(expr, "=>") != NULL) {
+        return true;
+    }
+    return strncmp(expr, "function", 8) == 0 || strncmp(expr, "async", 5) == 0;
+}
+
+/* Does this argument name a function that exists in the graph? */
+static bool arg_resolves_to_function(const char *ident, const cbm_registry_t *registry,
+                                     const cbm_gbuf_t *gbuf, const char *module_qn,
+                                     const char **ik, const char **iv, int ic) {
+    if (!ident || !ident[0] || !registry || !gbuf) {
+        return false;
+    }
+    cbm_resolution_t res = cbm_registry_resolve(registry, ident, module_qn, ik, iv, ic);
+    if (!res.qualified_name || !res.qualified_name[0]) {
+        return false;
+    }
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, res.qualified_name);
+    if (!node || !node->label) {
+        return false;
+    }
+    return strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0;
+}
+
+bool cbm_pipeline_is_route_registration(const CBMCall *call, const cbm_registry_t *registry,
+                                        const cbm_gbuf_t *gbuf, const char *module_qn,
+                                        const char **imp_keys, const char **imp_vals,
+                                        int imp_count) {
+    if (!call) {
+        return false;
+    }
+    char tail[CBM_SZ_128];
+    if (receiver_is_router_like(callee_receiver_tail(call->callee_name, tail, sizeof(tail)))) {
+        return true;
+    }
+    /* A non-member call (`get("/x", h)`) carries no receiver evidence; the
+     * framework tables already vouch for those, so keep them registrations. */
+    if (call->callee_name && strchr(call->callee_name, '.') == NULL &&
+        strstr(call->callee_name, "::") == NULL) {
+        return true;
+    }
+    for (int i = SKIP_ONE; i < call->arg_count; i++) {
+        if (arg_is_inline_function(call->args[i].expr)) {
+            return true;
+        }
+    }
+    /* A router bound to a name we cannot recognise (`const v1 = Router()`) is
+     * still a registration when the argument after the path is a real function.
+     * A client call puts a request body there, which resolves to nothing. */
+    return arg_resolves_to_function(call->second_arg_name, registry, gbuf, module_qn, imp_keys,
+                                    imp_vals, imp_count);
+}
+
+bool cbm_pipeline_is_router_mount(const char *callee_name) {
+    if (!callee_name) {
+        return false;
+    }
+    size_t len = strlen(callee_name);
+    const size_t use_len = 4; /* ".use" */
+    return len >= use_len && strcmp(callee_name + len - use_len, ".use") == 0;
+}
+
+/* Extract the mount path from a raw argument.  Returns false when the argument
+ * is not a path (middleware call, bare identifier, options object). */
+static bool mount_prefix_from_arg(const char *raw, char *out, int out_sz) {
+    if (!raw) {
+        return false;
+    }
+    const char *p = raw;
+    if (*p == '`' || *p == '"' || *p == '\'') {
+        p++;
+    }
+    /* Drop a leading `${...}` — the deploy-dependent prefix variable. */
+    if (*p == '$' && *(p + SKIP_ONE) == '{') {
+        p += PAIR_LEN;
+        while (*p && *p != '}') {
+            p++;
+        }
+        if (*p == '}') {
+            p++;
+        }
+    }
+    if (*p != '/') {
+        return false;
+    }
+    int oi = 0;
+    while (*p && oi < out_sz - PAIR_LEN) {
+        if (*p == '$' && *(p + SKIP_ONE) == '{') {
+            /* Interior substitution is a real path parameter: `${liveId}`. */
+            out[oi++] = ':';
+            p += PAIR_LEN;
+            while (*p && *p != '}' && oi < out_sz - PAIR_LEN) {
+                out[oi++] = *p++;
+            }
+            if (*p == '}') {
+                p++;
+            }
+        } else if (*p == '`' || *p == '"' || *p == '\'' || *p == '?') {
+            break;
+        } else {
+            out[oi++] = *p++;
+        }
+    }
+    /* A bare "/" mount adds nothing and would double every slash. */
+    while (oi > SKIP_ONE && out[oi - SKIP_ONE] == '/') {
+        oi--;
+    }
+    out[oi] = '\0';
+    return oi > SKIP_ONE && !is_junk_url(out);
+}
+
+/* Read a JSON string property ("key":"value") out of an edge properties blob. */
+static bool mount_json_str_prop(const char *json, const char *key, char *out, size_t out_sz) {
+    if (!json || !key || !out || out_sz == 0) {
+        return false;
+    }
+    char needle[CBM_SZ_64];
+    int nn = snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    if (nn <= 0 || (size_t)nn >= sizeof(needle)) {
+        return false;
+    }
+    const char *p = strstr(json, needle);
+    if (!p) {
+        return false;
+    }
+    p += nn;
+    size_t oi = 0;
+    while (*p && *p != '"' && oi < out_sz - SKIP_ONE) {
+        if (*p == '\\' && *(p + SKIP_ONE)) {
+            p++;
+        }
+        out[oi++] = *p++;
+    }
+    out[oi] = '\0';
+    return oi > 0;
+}
+
+/* Resolve a router identifier to the module it was imported from.
+ *
+ * The registry cannot do this: a router arrives as a default import
+ * (`import orgRoutes from "./routes/orgRoutes.js"`), which binds a local name to
+ * a module rather than to an indexed symbol, so resolution comes back empty and
+ * the import map handed to the call pass is empty at this point.  The IMPORTS
+ * edge already records the binding under `local_name`, which is exactly the
+ * identifier written at the mount site. */
+static const cbm_gbuf_node_t *mount_router_by_import(const cbm_gbuf_t *main_gbuf,
+                                                     const char *file_path, const char *ident) {
+    if (!main_gbuf || !file_path || !file_path[0] || !ident) {
+        return NULL;
+    }
+    /* IMPORTS edges hang off the file's __file__ node, whose QN this function
+     * cannot rebuild without the project name — so match on the file path of
+     * whatever node the edge starts from. */
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_type(main_gbuf, "IMPORTS", &edges, &count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        char local[CBM_SZ_256];
+        if (!mount_json_str_prop(edges[i]->properties_json, "local_name", local, sizeof(local))) {
+            continue;
+        }
+        if (strcmp(local, ident) != 0) {
+            continue;
+        }
+        const cbm_gbuf_node_t *importer = cbm_gbuf_find_by_id(main_gbuf, edges[i]->source_id);
+        if (!importer || !importer->file_path || strcmp(importer->file_path, file_path) != 0) {
+            continue;
+        }
+        return cbm_gbuf_find_by_id(main_gbuf, edges[i]->target_id);
+    }
+    return NULL;
+}
+
+/* Is this argument a bare identifier (a router reference), as opposed to a
+ * string, a middleware invocation, or an inline function? */
+static bool is_bare_identifier_arg(const char *expr) {
+    if (!expr || !expr[0]) {
+        return false;
+    }
+    if (expr[0] == '/' || expr[0] == '"' || expr[0] == '\'' || expr[0] == '`' || expr[0] == '{' ||
+        expr[0] == '[') {
+        return false;
+    }
+    for (const char *c = expr; *c; c++) {
+        if (*c == '(' || *c == ')' || *c == ' ' || *c == '=' || *c == '>') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Emit one MOUNTS edge per router argument of an app.use(path, ...) call. */
+void cbm_pipeline_emit_router_mount(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                    const CBMCall *call, const char *module_qn,
+                                    const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
+                                    const char **ik, const char **iv, int ic) {
+    if (call->arg_count < PAIR_LEN) {
+        return;
+    }
+    const CBMCallArg *first = &call->args[0];
+    const char *raw = first->value ? first->value : first->expr;
+    char prefix[CBM_SZ_256];
+    if (!mount_prefix_from_arg(raw, prefix, (int)sizeof(prefix))) {
+        return;
+    }
+    char esc_prefix[CBM_SZ_512];
+    cbm_json_escape(esc_prefix, sizeof(esc_prefix), prefix);
+
+    /* Every trailing identifier is a candidate router: one app.use can mount
+     * several (brand-exposure mounts captures and report on the same path). */
+    for (int ai = SKIP_ONE; ai < call->arg_count; ai++) {
+        const CBMCallArg *ca = &call->args[ai];
+        if (!is_bare_identifier_arg(ca->expr)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *router =
+            mount_router_by_import(main_gbuf, source->file_path, ca->expr);
+        if (!router) {
+            /* Same-file router, or a language whose imports the registry does
+             * resolve — fall back to ordinary symbol resolution. */
+            cbm_resolution_t rres = cbm_registry_resolve(registry, ca->expr, module_qn, ik, iv, ic);
+            if (rres.qualified_name && rres.qualified_name[0]) {
+                router = cbm_gbuf_find_by_qn(main_gbuf, rres.qualified_name);
+            }
+        }
+        if (!router || !router->file_path || !router->file_path[0]) {
+            continue;
+        }
+        char props[CBM_SZ_1K];
+        snprintf(props, sizeof(props), "{\"prefix\":\"%s\",\"via\":\"router_mount\"}",
+                 esc_prefix);
+        cbm_gbuf_insert_edge(gbuf, source->id, router->id, "MOUNTS", props);
+    }
+}
+
 static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler) {
     *out_handler = NULL;
     /* 1. First string arg starting with / */
@@ -2026,6 +2330,12 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
         const char *route_path = find_route_path_in_args(call, &handler_ref);
+        if (route_path && !cbm_pipeline_is_route_registration(call, registry, main_gbuf,
+                                                              module_qn, imp_keys, imp_vals,
+                                                              imp_count)) {
+            emit_http_async_service_edge(gbuf, source, call, res, CBM_SVC_HTTP, route_path);
+            return;
+        }
         if (route_path) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count);
@@ -2484,6 +2794,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
          * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
          * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+        /* Router mounts are classified by nothing: a mount matches no service
+         * pattern and carries no verb suffix, so the dispatcher below never
+         * routes it to emit_service_edge.  Record it here, where every call is
+         * still visible, and let the normal classification continue. */
+        if (cbm_pipeline_is_router_mount(call->callee_name)) {
+            cbm_pipeline_emit_router_mount(ws->local_edge_buf, source_node, call, module_qn,
+                                           rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                                           imp_count);
+        }
+
         cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;

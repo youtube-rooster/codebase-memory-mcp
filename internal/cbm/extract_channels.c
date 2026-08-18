@@ -128,6 +128,27 @@ static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
             }
         }
 
+        /* `this.queueName = "all-processed.queue"` — a constructor field is how
+         * a consumer class names the queue it reads.  Without this the name
+         * argument never resolves to a literal and the queue has no listener. */
+        if (strcmp(kind, "assignment_expression") == 0) {
+            TSNode lhs = ts_node_child_by_field_name(node, TS_FIELD("left"));
+            TSNode rhs = ts_node_child_by_field_name(node, TS_FIELD("right"));
+            if (!ts_node_is_null(lhs) && !ts_node_is_null(rhs) &&
+                strcmp(ts_node_type(lhs), "member_expression") == 0 &&
+                (strcmp(ts_node_type(rhs), "string") == 0 ||
+                 strcmp(ts_node_type(rhs), "string_literal") == 0)) {
+                char *lhs_text = cbm_node_text(ctx->arena, lhs, ctx->source);
+                char *rhs_text = cbm_node_text(ctx->arena, rhs, ctx->source);
+                const char *unq_val = unquote_string(ctx->arena, rhs_text);
+                if (lhs_text && unq_val && tbl->count < CHAN_CONST_CAP) {
+                    tbl->items[tbl->count].name = lhs_text;
+                    tbl->items[tbl->count].value = unq_val;
+                    tbl->count++;
+                }
+            }
+        }
+
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
 }
@@ -224,7 +245,9 @@ static const char *extract_channel_name(CBMExtractCtx *ctx, TSNode args,
     }
     if (!channel_name && consts) {
         const char *kind = ts_node_type(first);
-        if (strcmp(kind, "identifier") == 0) {
+        /* member_expression covers `this.queueName`, recorded by the constant
+         * scan above under its full text. */
+        if (strcmp(kind, "identifier") == 0 || strcmp(kind, "member_expression") == 0) {
             char *ident = cbm_node_text(ctx->arena, first, ctx->source);
             channel_name = resolve_identifier(consts, ident);
         }
@@ -287,8 +310,15 @@ static const char *js_classify_receiver(CBMExtractCtx *ctx, TSNode object_node) 
     if (strcmp(tail, "consumer") == 0) {
         return "kafka";
     }
-    /* RabbitMQ / AMQP */
-    if (strcmp(tail, "channel") == 0 && !strcmp(text, "channel")) {
+    /* RabbitMQ / AMQP.  The receiver is either a raw amqplib channel handle or
+     * a wrapper that owns one.  Matching only the exact text "channel" missed
+     * both `conn.channel.sendToQueue(...)` and the common consumer shape where
+     * the handle is a field (`this.queue.consume(...)`), so the LISTEN side of
+     * every queue was invisible while the EMIT side resolved. */
+    if (strcmp(tail, "channel") == 0 || strcmp(tail, "ch") == 0 ||
+        strcmp(tail, "queue") == 0 || strcmp(tail, "rabbitmq") == 0 ||
+        strcmp(tail, "amqp") == 0 || strcmp(tail, "broker") == 0 ||
+        strcmp(tail, "mq") == 0) {
         return "rabbitmq";
     }
     return NULL;
@@ -311,6 +341,112 @@ static bool js_is_amqp_listen(const char *method) {
     return method && (strcmp(method, "consume") == 0 || strcmp(method, "assertQueue") == 0);
 }
 
+/* ── Message-type discriminators ─────────────────────────────────
+ *
+ * A broker payload is routed by a field inside the message, not by the queue:
+ * one queue carries every event and the consumer switches on `type`.  The queue
+ * name alone therefore links two services but says nothing about which event
+ * crosses; publisher and handler of a given event stay unconnected.  Both sides
+ * are plain string literals, so we record them as channels on their own
+ * transport and let the existing cross-repo channel matcher pair them. */
+
+#define CHAN_MSGTYPE_TRANSPORT "message_type"
+
+static bool is_msgtype_key(const char *key) {
+    return key && (strcmp(key, "type") == 0 || strcmp(key, "event") == 0 ||
+                   strcmp(key, "eventType") == 0 || strcmp(key, "event_type") == 0 ||
+                   strcmp(key, "messageType") == 0 || strcmp(key, "message_type") == 0);
+}
+
+/* Strip quotes from a property key node's text (`"type"` and `type` both occur). */
+static const char *pair_key_text(CBMExtractCtx *ctx, TSNode key_node) {
+    char *raw = cbm_node_text(ctx->arena, key_node, ctx->source);
+    if (!raw) {
+        return NULL;
+    }
+    const char *unq = unquote_string(ctx->arena, raw);
+    return unq ? unq : raw;
+}
+
+/* Walk a published call's arguments for `{ type: "dynamic_on_air", ... }`.
+ * The object is usually nested inside JSON.stringify(...) and Buffer.from(...),
+ * so this walks the whole argument subtree rather than the top level only. */
+static void js_emit_message_types(CBMExtractCtx *ctx, TSNode args) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->arena, args);
+
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "pair") == 0) {
+            TSNode key = ts_node_child_by_field_name(node, TS_FIELD("key"));
+            TSNode val = ts_node_child_by_field_name(node, TS_FIELD("value"));
+            if (!ts_node_is_null(key) && !ts_node_is_null(val) &&
+                is_msgtype_key(pair_key_text(ctx, key))) {
+                const char *type_name = literal_from_arg(ctx, val);
+                if (type_name && type_name[0]) {
+                    push_channel(ctx, type_name, CHAN_MSGTYPE_TRANSPORT, CBM_CHANNEL_EMIT, node);
+                }
+            }
+        }
+        ts_nstack_push_children(&stack, ctx->arena, node);
+    }
+}
+
+/* `switch (type) { case "dynamic_on_air": ... }` — the handler side.  Only a
+ * switch whose discriminant is named like a message-type field qualifies, so an
+ * unrelated switch over a status enum does not manufacture channels. */
+static void js_listen_message_types(CBMExtractCtx *ctx, TSNode sw) {
+    TSNode disc = ts_node_child_by_field_name(sw, TS_FIELD("value"));
+    if (ts_node_is_null(disc)) {
+        return;
+    }
+    char *disc_text = cbm_node_text(ctx->arena, disc, ctx->source);
+    if (!disc_text) {
+        return;
+    }
+    /* The grammar hands back a parenthesized_expression, so the raw text is
+     * "(type)"; strip the wrapper before comparing against the key names. */
+    const char *tail = disc_text;
+    while (*tail == '(' || *tail == ' ') {
+        tail++;
+    }
+    char disc_bare[CHAN_IDENT_MAX];
+    size_t di = 0;
+    while (tail[di] && tail[di] != ')' && tail[di] != ' ' && di < sizeof(disc_bare) - 1) {
+        disc_bare[di] = tail[di];
+        di++;
+    }
+    disc_bare[di] = '\0';
+    tail = disc_bare;
+    const char *dot = strrchr(tail, '.');
+    if (dot) {
+        tail = dot + SKIP_ONE;
+    }
+    if (!is_msgtype_key(tail)) {
+        return;
+    }
+    TSNode body = ts_node_child_by_field_name(sw, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode kase = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(kase), "switch_case") != 0) {
+            continue;
+        }
+        TSNode label = ts_node_child_by_field_name(kase, TS_FIELD("value"));
+        if (ts_node_is_null(label)) {
+            continue;
+        }
+        const char *type_name = literal_from_arg(ctx, label);
+        if (type_name && type_name[0]) {
+            push_channel(ctx, type_name, CHAN_MSGTYPE_TRANSPORT, CBM_CHANNEL_LISTEN, kase);
+        }
+    }
+}
+
 static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_table_t *consts) {
     TSNode func = ts_node_child_by_field_name(call, TS_FIELD("function"));
     if (ts_node_is_null(func) || strcmp(ts_node_type(func), "member_expression") != 0) {
@@ -324,6 +460,13 @@ static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
 
     char *method = cbm_node_text(ctx->arena, property, ctx->source);
     const char *transport = js_classify_receiver(ctx, object);
+    /* sendToQueue/assertQueue are amqplib-exclusive method names: the method
+     * alone pins the transport, so a wrapper whose name we cannot classify
+     * (queueFactory.rabbitmq, an injected client) still yields a channel. */
+    if (!transport && method &&
+        (strcmp(method, "sendToQueue") == 0 || strcmp(method, "assertQueue") == 0)) {
+        transport = "rabbitmq";
+    }
     if (!transport) {
         return;
     }
@@ -360,6 +503,12 @@ static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
     if (ts_node_is_null(args)) {
         return;
     }
+    /* The discriminator travels with the payload, so it is recorded even when
+     * the queue name itself stays unresolved (config-driven or computed). */
+    if (direction == CBM_CHANNEL_EMIT &&
+        (strcmp(transport, "rabbitmq") == 0 || strcmp(transport, "kafka") == 0)) {
+        js_emit_message_types(ctx, args);
+    }
     const char *channel_name = extract_channel_name(ctx, args, consts);
     if (!channel_name) {
         return;
@@ -380,6 +529,8 @@ static void extract_channels_js(CBMExtractCtx *ctx) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call_expression") == 0) {
             js_process_call(ctx, node, &consts);
+        } else if (strcmp(ts_node_type(node), "switch_statement") == 0) {
+            js_listen_message_types(ctx, node);
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }

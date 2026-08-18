@@ -411,7 +411,19 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  bool suppress_plain_calls) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+        if (cbm_pipeline_is_route_registration(call, ctx->registry, ctx->gbuf, module_qn,
+                                               imp_keys, imp_vals, imp_count)) {
+            handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+            return;
+        }
+        /* A client call wearing a verb suffix: emit the HTTP edge cross-repo
+         * matching actually reads. */
+        cbm_resolution_t http_res = {.qualified_name = call->callee_name,
+                                     .confidence = PC_SVC_PATTERN_CONF,
+                                     .strategy = "verb_suffix_client",
+                                     .candidate_count = 0};
+        emit_http_async_edge(ctx, call, source, NULL, &http_res, CBM_SVC_HTTP,
+                             suppress_plain_calls);
         return;
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
@@ -465,6 +477,19 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 }
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
+/* Record a router mount before classification: the sequential dispatcher, like
+ * the parallel one, has no branch a mount would fall into. */
+static void calls_record_router_mount(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                      const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                      const char **imp_keys, const char **imp_vals,
+                                      int imp_count) {
+    if (!source_node || !cbm_pipeline_is_router_mount(call->callee_name)) {
+        return;
+    }
+    cbm_pipeline_emit_router_mount(ctx->gbuf, source_node, call, module_qn, ctx->registry,
+                                   ctx->gbuf, imp_keys, imp_vals, imp_count);
+}
+
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
@@ -473,6 +498,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!source_node) {
         return 0;
     }
+
+    calls_record_router_mount(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count);
 
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
@@ -558,8 +585,17 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
          * sequential path minted zero Route nodes for such files. */
         if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
             call->first_string_arg[0] == '/') {
-            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
-                                      imp_count);
+            if (cbm_pipeline_is_route_registration(call, ctx->registry, ctx->gbuf, module_qn,
+                                                   imp_keys, imp_vals, imp_count)) {
+                handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                          imp_count);
+            } else {
+                cbm_resolution_t http_res = {.qualified_name = call->callee_name,
+                                             .confidence = PC_SVC_PATTERN_CONF,
+                                             .strategy = "verb_suffix_client",
+                                             .candidate_count = 0};
+                emit_http_async_edge(ctx, call, source_node, NULL, &http_res, CBM_SVC_HTTP, false);
+            }
             return SKIP_ONE;
         }
         cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
