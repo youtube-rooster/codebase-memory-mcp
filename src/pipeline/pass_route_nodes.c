@@ -652,7 +652,18 @@ static int mount_compose_one(cbm_gbuf_t *gb, int64_t registrar_id, int64_t fragm
         return 0; /* the mount added nothing */
     }
 
-    /* Snapshot the handlers while no insert has happened yet. */
+    /* Snapshot the handlers while no insert has happened yet.
+     *
+     * Fragments are shared: the node is keyed by method+path alone, so every
+     * router file that registers `router.get('/', ...)` piles its HANDLES onto
+     * the SAME `__route__GET__/` node.  Carrying that whole pile onto the
+     * composed route hands `/lives` the handlers of every unrelated router that
+     * also declares a root route — and find_route_handler's LIMIT 1 then
+     * reports one of them, arbitrarily, as THE handler.  Each HANDLES edge
+     * records the file that declared its registration (decl_file); only the
+     * handlers the mounted router file registered cross over.  Edges without a
+     * decl_file (decorator-pass HANDLES) keep the old carry-everything
+     * behaviour — their emitters have no declaring-file notion yet. */
     const cbm_gbuf_edge_t **handles = NULL;
     int hcount = 0;
     cbm_gbuf_find_edges_by_target_type(gb, fragment_id, "HANDLES", &handles, &hcount);
@@ -662,6 +673,13 @@ static int mount_compose_one(cbm_gbuf_t *gb, int64_t registrar_id, int64_t fragm
         handler_ids = (int64_t *)calloc((size_t)hcount, sizeof(int64_t));
         if (handler_ids) {
             for (int i = 0; i < hcount; i++) {
+                char decl_file[CBM_SZ_512];
+                if (handles[i]->properties_json &&
+                    extract_json_prop(handles[i]->properties_json, "decl_file", decl_file,
+                                      sizeof(decl_file)) &&
+                    decl_file[0] && strcmp(decl_file, router_file) != 0) {
+                    continue;
+                }
                 handler_ids[handler_count++] = handles[i]->source_id;
             }
         }
@@ -685,8 +703,12 @@ static int mount_compose_one(cbm_gbuf_t *gb, int64_t registrar_id, int64_t fragm
         char esc_h[CBM_SZ_512];
         cbm_json_escape(esc_h, sizeof(esc_h),
                         handler->qualified_name ? handler->qualified_name : "");
-        char hprops[CBM_SZ_1K];
-        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"router_mount\"}", esc_h);
+        char esc_df[CBM_SZ_512];
+        cbm_json_escape(esc_df, sizeof(esc_df), router_file ? router_file : "");
+        char hprops[CBM_SZ_2K];
+        snprintf(hprops, sizeof(hprops),
+                 "{\"handler\":\"%s\",\"source\":\"router_mount\",\"decl_file\":\"%s\"}", esc_h,
+                 esc_df);
         cbm_gbuf_insert_edge(gb, handler_ids[i], full_id, "HANDLES", hprops);
     }
     free(handler_ids);

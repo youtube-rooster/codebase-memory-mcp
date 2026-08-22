@@ -34,6 +34,7 @@ enum {
     CHAN_IDENT_MAX = 128,  /* max identifier length tracked */
     CHAN_STACK_CAP = 4096, /* traversal stack depth per walk    */
     CHAN_DIR_UNKNOWN = -1, /* unrecognized method → no channel */
+    CHAN_CMP_CHILDREN = 3, /* left OP right — simple binary comparison */
 };
 
 typedef struct {
@@ -154,6 +155,26 @@ static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
 }
 
 /* Python constant resolution: NAME = "value" (assignment node). */
+/* Name of the class body an assignment sits in, or NULL at module level. */
+static const char *py_enclosing_class_name(CBMExtractCtx *ctx, TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    while (!ts_node_is_null(parent)) {
+        const char *pk = ts_node_type(parent);
+        if (strcmp(pk, "class_definition") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+            if (ts_node_is_null(name_node)) {
+                return NULL;
+            }
+            return cbm_node_text(ctx->arena, name_node, ctx->source);
+        }
+        if (strcmp(pk, "function_definition") == 0) {
+            return NULL;
+        }
+        parent = ts_node_parent(parent);
+    }
+    return NULL;
+}
+
 static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
@@ -178,6 +199,17 @@ static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tb
                     tbl->items[tbl->count].name = name;
                     tbl->items[tbl->count].value = val;
                     tbl->count++;
+                    /* `class Queues: MODERATION = "..."` is referenced as
+                     * `Queues.MODERATION`; record that spelling too. */
+                    const char *owner = py_enclosing_class_name(ctx, node);
+                    if (owner && tbl->count < CHAN_CONST_CAP) {
+                        char *qualified = cbm_arena_sprintf(ctx->arena, "%s.%s", owner, name);
+                        if (qualified) {
+                            tbl->items[tbl->count].name = qualified;
+                            tbl->items[tbl->count].value = val;
+                            tbl->count++;
+                        }
+                    }
                 }
             }
         }
@@ -268,6 +300,19 @@ static void push_channel(CBMExtractCtx *ctx, const char *channel_name, const cha
     cbm_channels_push(&ctx->result->channels, ctx->arena, ch);
 }
 
+/* The message-type namespace: channels routed by a discriminator field inside
+ * the payload (or by the in-house bus port's event-name argument), not by a
+ * queue or socket name.  Shared by the JS and Python extractors so producer
+ * and consumer land on the same QN regardless of language. */
+#define CHAN_MSGTYPE_TRANSPORT "message_type"
+
+/* Case-sensitive suffix check on an already-isolated receiver tail. */
+static bool tail_has_suffix(const char *tail, const char *suffix) {
+    size_t tl = strlen(tail);
+    size_t sl = strlen(suffix);
+    return tl >= sl && strcmp(tail + tl - sl, suffix) == 0;
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JS/TS/TSX — Socket.IO, EventEmitter, WebSocket, Kafka, RabbitMQ
  * ══════════════════════════════════════════════════════════════════ */
@@ -321,6 +366,15 @@ static const char *js_classify_receiver(CBMExtractCtx *ctx, TSNode object_node) 
         strcmp(tail, "mq") == 0) {
         return "rabbitmq";
     }
+    /* In-house bus port (ports-and-adapters over SNS/SQS or similar): the
+     * handle is named for its role — `publisher.publish('coins_changed', body)`,
+     * `deps.publisher`, `busPublisher`.  The name argument is the envelope's
+     * `event` discriminator, i.e. the message_type namespace, NOT a queue: the
+     * consumer on the other side dispatches on `msg.event`, so this is the only
+     * labelling under which producer and consumer share a QN. */
+    if (strcmp(tail, "publisher") == 0 || tail_has_suffix(tail, "Publisher")) {
+        return CHAN_MSGTYPE_TRANSPORT;
+    }
     return NULL;
 }
 
@@ -349,8 +403,6 @@ static bool js_is_amqp_listen(const char *method) {
  * crosses; publisher and handler of a given event stay unconnected.  Both sides
  * are plain string literals, so we record them as channels on their own
  * transport and let the existing cross-repo channel matcher pair them. */
-
-#define CHAN_MSGTYPE_TRANSPORT "message_type"
 
 static bool is_msgtype_key(const char *key) {
     return key && (strcmp(key, "type") == 0 || strcmp(key, "event") == 0 ||
@@ -488,12 +540,30 @@ static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
         } else {
             return;
         }
+    } else if (strcmp(transport, CHAN_MSGTYPE_TRANSPORT) == 0) {
+        /* In-house bus publisher handle: only its two port verbs qualify. */
+        if (method && strcmp(method, "publish") == 0) {
+            direction = CBM_CHANNEL_EMIT;
+        } else if (method && strcmp(method, "subscribe") == 0) {
+            direction = CBM_CHANNEL_LISTEN;
+        } else {
+            return;
+        }
     } else {
         /* socketio / event_emitter */
         if (js_is_emit_method(method)) {
             direction = CBM_CHANNEL_EMIT;
         } else if (js_is_listen_method(method)) {
             direction = CBM_CHANNEL_LISTEN;
+        } else if (strcmp(transport, "event_emitter") == 0 && method &&
+                   (strcmp(method, "publish") == 0 || strcmp(method, "subscribe") == 0)) {
+            /* A receiver named `bus`/`eventBus`/`pubsub` speaking publish/
+             * subscribe is not Node's EventEmitter — it is the in-house bus
+             * port, and the name argument is the envelope's event
+             * discriminator.  Same namespace as the consumer's `switch
+             * (msg.event)`, so re-label instead of dropping the call. */
+            transport = CHAN_MSGTYPE_TRANSPORT;
+            direction = strcmp(method, "publish") == 0 ? CBM_CHANNEL_EMIT : CBM_CHANNEL_LISTEN;
         } else {
             return;
         }
@@ -569,6 +639,29 @@ static const char *py_classify_receiver(CBMExtractCtx *ctx, TSNode object_node) 
     if (strcmp(tail, "consumer") == 0) {
         return "kafka";
     }
+    /* RabbitMQ: aio-pika/pika wrappers are named for what they wrap. */
+    if (strstr(tail, "rabbitmq") != NULL || strstr(tail, "amqp") != NULL ||
+        strcmp(tail, "broker") == 0 || strcmp(tail, "_broker") == 0 ||
+        strcmp(tail, "queue_client") == 0 || strcmp(tail, "exchange") == 0 ||
+        strcmp(tail, "queue") == 0 || strcmp(tail, "channel") == 0) {
+        return "rabbitmq";
+    }
+    /* Redis pub/sub */
+    if (strstr(tail, "redis") != NULL || strcmp(tail, "pubsub") == 0) {
+        return "redis";
+    }
+    /* boto3 */
+    if (strcmp(tail, "sns") == 0 || strcmp(tail, "sns_client") == 0) {
+        return "sns";
+    }
+    if (strcmp(tail, "sqs") == 0 || strcmp(tail, "sqs_client") == 0) {
+        return "sqs";
+    }
+    /* An in-house bus port: the transport is hidden, the topology is not. */
+    if (tail_has_suffix(tail, "publisher") || tail_has_suffix(tail, "Publisher") ||
+        strcmp(tail, "bus") == 0 || strcmp(tail, "_bus") == 0) {
+        return "bus";
+    }
     return NULL;
 }
 
@@ -595,6 +688,19 @@ static const struct {
     {"websocket", "receive_text", CBM_CHANNEL_LISTEN},
     {"websocket", "receive_json", CBM_CHANNEL_LISTEN},
     {"websocket", "receive_bytes", CBM_CHANNEL_LISTEN},
+    {"rabbitmq", "publish", CBM_CHANNEL_EMIT},
+    {"rabbitmq", "basic_publish", CBM_CHANNEL_EMIT},
+    {"rabbitmq", "consume", CBM_CHANNEL_LISTEN},
+    {"rabbitmq", "basic_consume", CBM_CHANNEL_LISTEN},
+    {"rabbitmq", "start_consuming", CBM_CHANNEL_LISTEN},
+    {"redis", "publish", CBM_CHANNEL_EMIT},
+    {"redis", "subscribe", CBM_CHANNEL_LISTEN},
+    {"redis", "psubscribe", CBM_CHANNEL_LISTEN},
+    {"sns", "publish", CBM_CHANNEL_EMIT},
+    {"sqs", "send_message", CBM_CHANNEL_EMIT},
+    {"sqs", "receive_message", CBM_CHANNEL_LISTEN},
+    {"bus", "publish", CBM_CHANNEL_EMIT},
+    {"bus", "subscribe", CBM_CHANNEL_LISTEN},
     {NULL, "emit", CBM_CHANNEL_EMIT},
     {NULL, "send", CBM_CHANNEL_EMIT},
     {NULL, "on", CBM_CHANNEL_LISTEN},
@@ -612,6 +718,87 @@ static int py_classify_direction(const char *transport, const char *method) {
         }
     }
     return CHAN_DIR_UNKNOWN;
+}
+
+/* Keyword arguments that name a channel, most specific first: `routing_key`
+ * is what a consumer binds to, `exchange` only the broker it binds through. */
+static bool py_is_channel_kwarg(const char *key) {
+    static const char *keys[] = {"routing_key", "queue_name", "queue",  "topic",
+                                 "channel",     "event",      "subject", "exchange",
+                                 "QueueUrl",    "TopicArn",   NULL};
+    for (int i = 0; keys[i]; i++) {
+        if (strcmp(key, keys[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Resolve a channel-naming expression: literal, then the file's constant table,
+ * then the dotted source text.  `Exchanges.SENTIMENT_ANALYSIS` is defined in
+ * another file, so the text is all we have — and it is enough to match the
+ * producer against the consumer that names the same constant. */
+static const char *py_value_as_channel(CBMExtractCtx *ctx, TSNode value,
+                                       const chan_const_table_t *consts) {
+    const char *name = literal_from_arg(ctx, value);
+    if (!name) {
+        name = literal_from_first_child(ctx, value);
+    }
+    if (name) {
+        return name;
+    }
+    const char *kind = ts_node_type(value);
+    if (strcmp(kind, "identifier") != 0 && strcmp(kind, "attribute") != 0) {
+        return NULL;
+    }
+    char *text = cbm_node_text(ctx->arena, value, ctx->source);
+    if (!text || !text[0]) {
+        return NULL;
+    }
+    const char *resolved = resolve_identifier(consts, text);
+    if (resolved) {
+        return resolved;
+    }
+    const char *dot = strrchr(text, '.');
+    if (dot) {
+        resolved = resolve_identifier(consts, dot + SKIP_ONE);
+        if (resolved) {
+            return resolved;
+        }
+    }
+    /* A bare local (`queue_name`) carries no information; a dotted constant
+     * reference does. */
+    return dot ? text : NULL;
+}
+
+/* Emit one channel per channel-naming keyword argument.  Returns how many. */
+static int py_emit_kwarg_channels(CBMExtractCtx *ctx, TSNode args, const char *transport,
+                                  CBMChannelDirection direction,
+                                  const chan_const_table_t *consts, TSNode call) {
+    int emitted = 0;
+    uint32_t n = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (strcmp(ts_node_type(arg), "keyword_argument") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(arg, TS_FIELD("name"));
+        TSNode value = ts_node_child_by_field_name(arg, TS_FIELD("value"));
+        if (ts_node_is_null(key) || ts_node_is_null(value)) {
+            continue;
+        }
+        char *key_text = cbm_node_text(ctx->arena, key, ctx->source);
+        if (!key_text || !py_is_channel_kwarg(key_text)) {
+            continue;
+        }
+        const char *name = py_value_as_channel(ctx, value, consts);
+        if (!name) {
+            continue;
+        }
+        push_channel(ctx, name, transport, direction, call);
+        emitted++;
+    }
+    return emitted;
 }
 
 static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_table_t *consts) {
@@ -632,7 +819,17 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
 
     char *method = cbm_node_text(ctx->arena, attr, ctx->source);
     const char *transport = py_classify_receiver(ctx, object);
-    if (!transport || !method) {
+    if (!method) {
+        return;
+    }
+    /* An unrecognised receiver still names a broker when the method only makes
+     * sense on one.  Deliberately narrow: `send_message` is left out because
+     * plenty of non-broker services have one. */
+    if (!transport && (strcmp(method, "publish") == 0 || strcmp(method, "basic_publish") == 0 ||
+                       strcmp(method, "consume") == 0 || strcmp(method, "basic_consume") == 0)) {
+        transport = "rabbitmq";
+    }
+    if (!transport) {
         return;
     }
 
@@ -642,8 +839,22 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
     }
     CBMChannelDirection direction = (CBMChannelDirection)dir;
 
+    /* The in-house bus port routes by the envelope's `event` field —
+     * `bus.publish("mini_trendings", body)` names a message type, not a
+     * queue.  Store it under the shared message_type namespace so the QN
+     * matches the JS side of the same pipe (`publisher.publish(...)` producers
+     * and `switch (msg.event)` consumers); a "bus" label of its own would
+     * split one logical channel into two QNs the cross-repo matcher can never
+     * pair. */
+    if (strcmp(transport, "bus") == 0) {
+        transport = CHAN_MSGTYPE_TRANSPORT;
+    }
+
     TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
     if (ts_node_is_null(args)) {
+        return;
+    }
+    if (py_emit_kwarg_channels(ctx, args, transport, direction, consts, call) > 0) {
         return;
     }
     const char *channel_name = extract_channel_name(ctx, args, consts);
@@ -683,6 +894,11 @@ static void py_process_decorator(CBMExtractCtx *ctx, TSNode decorator,
         if (!transport) {
             return;
         }
+        /* Same normalization as py_process_call: a bus-port listener names a
+         * message type, not a queue. */
+        if (strcmp(transport, "bus") == 0) {
+            transport = CHAN_MSGTYPE_TRANSPORT;
+        }
         TSNode args = ts_node_child_by_field_name(expr, TS_FIELD("arguments"));
         if (ts_node_is_null(args)) {
             return;
@@ -692,6 +908,77 @@ static void py_process_decorator(CBMExtractCtx *ctx, TSNode decorator,
             return;
         }
         push_channel(ctx, channel_name, transport, CBM_CHANNEL_LISTEN, decorator);
+    }
+}
+
+/* ── Python message-type consumers ───────────────────────────────
+ *
+ * The Python bus consumers dispatch with equality, not a registry call:
+ *
+ *     if msg.event != "new_comment":
+ *         return
+ *     ...
+ *     elif msg.event == "comment_moderated":
+ *
+ * This is the Python mirror of the JS `switch (msg.event)` handler — the
+ * only place the handled event's name appears at all.  Both the `==`
+ * dispatch and the `!=` early-return guard identify the event the enclosing
+ * handler consumes.
+ *
+ * Unlike the JS switch heuristic this deliberately EXCLUDES the bare field
+ * name `type`: `x.type == "assignment"` is ubiquitous in non-broker Python
+ * (AST tooling, enums, ORMs) and would fabricate channels wholesale.  The
+ * bus port's field is `event` (shared/bus/ports.py InboundMessage.event);
+ * the other spellings cover the same discriminator in snake/camel form. */
+static bool py_is_event_field(const char *key) {
+    return key && (strcmp(key, "event") == 0 || strcmp(key, "event_type") == 0 ||
+                   strcmp(key, "eventType") == 0 || strcmp(key, "message_type") == 0 ||
+                   strcmp(key, "messageType") == 0);
+}
+
+/* One side of the comparison must be an attribute whose final segment is an
+ * event field; returns its text validity, not the value. */
+static bool py_node_is_event_attribute(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "attribute") != 0) {
+        return false;
+    }
+    TSNode attr = ts_node_child_by_field_name(node, TS_FIELD("attribute"));
+    if (ts_node_is_null(attr)) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, attr, ctx->source);
+    return py_is_event_field(name);
+}
+
+static void py_listen_message_types(CBMExtractCtx *ctx, TSNode cmp) {
+    /* Simple binary comparison only: left OP right.  Chained comparisons
+     * (`a == b == c`) never carry this dispatch shape. */
+    if (ts_node_child_count(cmp) != CHAN_CMP_CHILDREN) {
+        return;
+    }
+    TSNode op = ts_node_child(cmp, SKIP_ONE);
+    const char *op_kind = ts_node_type(op);
+    if (strcmp(op_kind, "==") != 0 && strcmp(op_kind, "!=") != 0) {
+        return;
+    }
+    TSNode left = ts_node_child(cmp, 0);
+    TSNode right = ts_node_child(cmp, PAIR_LEN);
+
+    /* Accept both operand orders; the literal side names the channel. */
+    TSNode lit_node;
+    if (py_node_is_event_attribute(ctx, left)) {
+        lit_node = right;
+    } else if (py_node_is_event_attribute(ctx, right)) {
+        lit_node = left;
+    } else {
+        return;
+    }
+    const char *type_name = literal_from_arg(ctx, lit_node);
+    if (!type_name) {
+        type_name = literal_from_first_child(ctx, lit_node);
+    }
+    if (type_name && type_name[0]) {
+        push_channel(ctx, type_name, CHAN_MSGTYPE_TRANSPORT, CBM_CHANNEL_LISTEN, cmp);
     }
 }
 
@@ -710,6 +997,8 @@ static void extract_channels_python(CBMExtractCtx *ctx) {
             py_process_call(ctx, node, &consts);
         } else if (strcmp(kind, "decorator") == 0) {
             py_process_decorator(ctx, node, &consts);
+        } else if (strcmp(kind, "comparison_operator") == 0) {
+            py_listen_message_types(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - SKIP_ONE; i >= 0; i--) {

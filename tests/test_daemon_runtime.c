@@ -3550,7 +3550,23 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     SKIP_PLATFORM("requires a queryable copied process image");
 #else
     enum {
-        CHILD_READY_BOUND_MS = 5000,
+        /* The blocking "git" here is a fresh copy of this ~290MB self-image
+         * (see runtime_test_copy_self_image below). Standalone measurement
+         * (cp the current test-runner to a temp path, exec it, time until it
+         * writes its PID marker — no daemon, no pipeline involved at all)
+         * showed 3.5s-10.3s across 8 runs on this machine: macOS validates the
+         * code signature of a freshly-copied, unsigned, ~290MB Mach-O binary
+         * on first exec, and that cost is dominated by disk/page-cache state,
+         * not by anything this test or the daemon does. 5000ms routinely lost
+         * that race under normal build/test system load, independent of any
+         * pipeline/extraction code path (detect_changes goes straight from
+         * mcp.c to the shell subprocess spawn without touching the pipeline
+         * at all for a project with zero source files, and running with
+         * MallocGuardEdges/MallocScribble/MallocPreScribble/MallocErrorAbort
+         * never aborted, ruling out heap corruption as the cause of the
+         * missing marker). Widened with real headroom above the measured
+         * worst case instead of chasing the exact threshold. */
+        CHILD_READY_BOUND_MS = 20000,
         CHILD_CANCEL_BOUND_MS = 3000,
         CHILD_CLEANUP_BOUND_MS = 5000,
         REQUEST_TIMEOUT_MS = 15000,

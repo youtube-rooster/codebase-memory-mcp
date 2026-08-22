@@ -382,6 +382,19 @@ TEST(daemon_bootstrap_uses_one_stable_per_account_endpoint) {
  * silently replaced by the default. An explicit parent — the compile-time test
  * seam, the lifecycle guards' isolated namespace — keeps precedence over it. */
 TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
+    /* Save the inherited value FIRST: the parallel tail hands every suite its
+     * own CBM_RUNTIME_DIR, and dropping it here (instead of restoring it)
+     * would silently move every later test in this process back into the
+     * shared per-account namespace. */
+    char saved_runtime_env[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    const char *inherited_runtime_env = getenv("CBM_RUNTIME_DIR");
+    bool had_runtime_env = inherited_runtime_env != NULL &&
+                           (int)strlen(inherited_runtime_env) <
+                               (int)sizeof(saved_runtime_env);
+    if (had_runtime_env) {
+        (void)snprintf(saved_runtime_env, sizeof(saved_runtime_env), "%s",
+                       inherited_runtime_env);
+    }
     char override_parent[BOOTSTRAP_TEST_PATH_CAP] = {0};
     char canonical_override[BOOTSTRAP_TEST_PATH_CAP] = {0};
     char canonical_explicit[BOOTSTRAP_TEST_PATH_CAP] = {0};
@@ -424,8 +437,13 @@ TEST(daemon_bootstrap_runtime_dir_env_relocates_rendezvous) {
         unusable_set ? cbm_daemon_bootstrap_endpoint_new(NULL) : NULL;
 
     /* Restore before asserting: a failed assertion returns immediately, and a
-     * leaked CBM_RUNTIME_DIR would follow every later suite in this process. */
-    (void)cbm_unsetenv("CBM_RUNTIME_DIR");
+     * leaked CBM_RUNTIME_DIR would follow every later test in this process —
+     * as would a dropped one, when the wave scheduler injected it. */
+    if (had_runtime_env) {
+        (void)cbm_setenv("CBM_RUNTIME_DIR", saved_runtime_env, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_RUNTIME_DIR");
+    }
     cbm_daemon_ipc_endpoint_free(refused);
     cbm_daemon_ipc_endpoint_free(relocated);
     if (relocated_runtime[0] != '\0') {

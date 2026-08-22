@@ -5314,6 +5314,133 @@ TEST(iris_export_xml_multi_class) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * In-house bus port channels (message_type namespace)
+ *
+ * The RChat bus (TS `src/lib/bus/ports.ts` mirrored by Python
+ * `shared/bus/ports.py`) routes every event through one SNS→SQS pipe; the
+ * channel identity is the envelope's `event` field, not a queue name.  The
+ * producer side is `publisher.publish('event_name', body)` and the consumer
+ * side dispatches on `msg.event`.  Both must land on the SAME transport
+ * namespace ("message_type") or the cross-repo matcher can never pair them.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Find a channel by name+transport+direction. */
+static int has_channel(CBMFileResult *r, const char *name, const char *transport, int direction) {
+    for (int i = 0; i < r->channels.count; i++) {
+        CBMChannel *ch = &r->channels.items[i];
+        if (ch->channel_name && strcmp(ch->channel_name, name) == 0 && ch->transport &&
+            strcmp(ch->transport, transport) == 0 && (int)ch->direction == direction)
+            return 1;
+    }
+    return 0;
+}
+
+TEST(channel_js_bus_publisher_publish_is_message_type_emit) {
+    /* rchat-api gamification: `deps.publisher.publish('coins_changed', {...})`.
+     * The first argument IS the message-type discriminator — same namespace a
+     * consumer switch on `msg.event` lands in. */
+    CBMFileResult *r = extract("async function grantCoins(deps, userId) {\n"
+                               "  await deps.publisher.publish('coins_changed', { user_id: "
+                               "userId })\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "consumer.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "coins_changed", "message_type", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_bus_receiver_publish_is_message_type_emit) {
+    /* A receiver literally named `bus` classifies as event_emitter for
+     * emit/on, but `.publish` is the in-house port verb — the event name goes
+     * to the message_type namespace, not event_emitter. */
+    CBMFileResult *r = extract("async function fire(bus) {\n"
+                               "  await bus.publish('badge_awarded', { id: 1 })\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "award.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "badge_awarded", "message_type", CBM_CHANNEL_EMIT));
+    ASSERT_FALSE(has_channel(r, "badge_awarded", "event_emitter", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_unrelated_publish_receiver_is_not_a_channel) {
+    /* `repo.publish({...})` (rchat-api content module) is a repository method,
+     * not a bus port: no literal event name, receiver is not port-shaped. */
+    CBMFileResult *r = extract("async function publishContent(repo, draft) {\n"
+                               "  await repo.publish({ title: draft.title })\n"
+                               "  await service.publish('not_a_bus_event')\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "publish.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->channels.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_py_bus_publish_normalized_to_message_type) {
+    /* rchat-workers `publish.py`: `await bus.publish("mini_trendings", body)`.
+     * Historically labelled transport "bus", which split the QN namespace from
+     * the JS side's "message_type" for the SAME logical event pipe. */
+    CBMFileResult *r = extract("async def emit_insight(bus, body):\n"
+                               "    await bus.publish(\"mini_trendings\", body)\n",
+                               CBM_LANG_PYTHON, "t", "publish.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "mini_trendings", "message_type", CBM_CHANNEL_EMIT));
+    ASSERT_FALSE(has_channel(r, "mini_trendings", "bus", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_py_event_comparison_is_message_type_listen) {
+    /* rchat-workers handlers dispatch with `if msg.event != "new_comment":
+     * return` — the Python mirror of the JS `switch (msg.event)` consumer.
+     * Both the != guard and the == dispatch shape name the handled event. */
+    CBMFileResult *r = extract("async def handle(msg):\n"
+                               "    if msg.event != \"new_comment\":\n"
+                               "        return\n"
+                               "    await process(msg)\n"
+                               "\n"
+                               "async def ingest(msg):\n"
+                               "    if msg.event == \"comment_moderated\":\n"
+                               "        await moderate(msg)\n",
+                               CBM_LANG_PYTHON, "t", "handler.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "new_comment", "message_type", CBM_CHANNEL_LISTEN));
+    ASSERT(has_channel(r, "comment_moderated", "message_type", CBM_CHANNEL_LISTEN));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_py_non_event_comparison_is_not_a_channel) {
+    /* Negative invariant: `.type` comparisons are everywhere in non-broker
+     * Python (AST tooling, enums) — only event-ish fields qualify, and a bare
+     * identifier comparison names nothing.  None of these may fabricate a
+     * channel. */
+    CBMFileResult *r = extract("def walk(node, color):\n"
+                               "    if node.type == \"assignment\":\n"
+                               "        return 1\n"
+                               "    if color == \"red\":\n"
+                               "        return 2\n"
+                               "    if node.kind == \"call\":\n"
+                               "        return 3\n"
+                               "    if node.event == 3:\n"
+                               "        return 4\n",
+                               CBM_LANG_PYTHON, "t", "walk.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->channels.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -5637,6 +5764,12 @@ SUITE(extraction) {
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
+    RUN_TEST(channel_js_bus_publisher_publish_is_message_type_emit);
+    RUN_TEST(channel_js_bus_receiver_publish_is_message_type_emit);
+    RUN_TEST(channel_js_unrelated_publish_receiver_is_not_a_channel);
+    RUN_TEST(channel_py_bus_publish_normalized_to_message_type);
+    RUN_TEST(channel_py_event_comparison_is_message_type_listen);
+    RUN_TEST(channel_py_non_event_comparison_is_not_a_channel);
 
     cbm_shutdown();
 }

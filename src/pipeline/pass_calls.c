@@ -216,20 +216,49 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
+    /* Every HANDLES edge carries the file that DECLARED the registration
+     * (source_node's file).  Fragment Route nodes are deduped by method+path
+     * alone, so handlers from unrelated files pile onto one shared node; the
+     * mount-composition pass uses decl_file to carry over only the handlers
+     * the mounted router file actually registered. */
+    char esc_df[CBM_SZ_512];
+    cbm_json_escape(esc_df, sizeof(esc_df), source_node->file_path ? source_node->file_path : "");
+    bool handled = false;
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
                                                      module_qn, imp_keys, imp_vals, imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
-                char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                           closing brace */
+                char hprops[CBM_SZ_2K]; /* must exceed escaped values + wrapper or snprintf cuts
+                                           the closing brace */
                 char esc_h[CBM_SZ_512];
                 cbm_json_escape(esc_h, sizeof(esc_h), hres.qualified_name);
-                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
+                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"decl_file\":\"%s\"}",
+                         esc_h, esc_df);
                 cbm_gbuf_insert_edge(ctx->gbuf, handler->id, route_id, "HANDLES", hprops);
+                handled = true;
             }
         }
+    }
+    /* Inline handler (`app.get('/x', async () => ...)`) — Fastify's dominant
+     * shape, and common in Express too.  There is no name to resolve, so the
+     * route would carry no HANDLES at all, and cross-repo matching
+     * (find_route_handler) refuses routes without one: an all-inline service
+     * silently produces zero matches.  The enclosing scope — the plugin
+     * function, or the file for a top-level registration — owns the handler's
+     * code and carries the name and file_path the cross-repo report needs.
+     * Mirrors the parallel path's emit_route_registration. */
+    if (!handled && cbm_pipeline_call_has_inline_handler(call) &&
+        cbm_pipeline_callee_is_router_shaped(call->callee_name)) {
+        char hprops[CBM_SZ_2K];
+        char esc_h[CBM_SZ_512];
+        cbm_json_escape(esc_h, sizeof(esc_h),
+                        source_node->qualified_name ? source_node->qualified_name : "");
+        snprintf(hprops, sizeof(hprops),
+                 "{\"handler\":\"%s\",\"source\":\"inline_handler\",\"decl_file\":\"%s\"}", esc_h,
+                 esc_df);
+        cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "HANDLES", hprops);
     }
 }
 
@@ -410,6 +439,17 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
                                  bool suppress_plain_calls) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
+    /* Also detect route registration by callee-name suffix when the resolved
+     * QN matches no service pattern.  A weak short-name match can bind
+     * `app.get` to the one project symbol named `get` (a memoizer method, a
+     * map wrapper), and a QN-only check then hides the verb suffix: the route
+     * disappears AND the #606 suppression drops the fabricated plain edge, so
+     * one unrelated `get` symbol silently erased every sequential-path route.
+     * The parallel resolver has carried this exact fallback since #523/#952
+     * (pass_parallel.c emit_service_edge) — this restores seq/parallel parity. */
+    if (svc == CBM_SVC_NONE && cbm_service_pattern_route_method(call->callee_name) != NULL) {
+        svc = CBM_SVC_ROUTE_REG;
+    }
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
         if (cbm_pipeline_is_route_registration(call, ctx->registry, ctx->gbuf, module_qn,
                                                imp_keys, imp_vals, imp_count)) {

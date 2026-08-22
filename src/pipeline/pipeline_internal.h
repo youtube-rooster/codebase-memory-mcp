@@ -29,12 +29,25 @@
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
 
-/* Router mounts (`app.use("/org", middleware, orgRoutes)`).  Both the parallel
- * and the sequential call pass see mounts, and neither classifies them — a
- * mount matches no service pattern and carries no verb suffix — so the
- * extractor is shared rather than duplicated.  Emits one MOUNTS edge per router
- * argument; cbm_pipeline_apply_router_mounts later turns those into full paths. */
+/* Router mounts — Express `app.use("/org", middleware, orgRoutes)` and Fastify
+ * `app.register(socialModule, { prefix: '/social' })`.  Both the parallel and
+ * the sequential call pass see mounts, and neither classifies them — a mount
+ * matches no service pattern (`.register` wears a route suffix but never a
+ * path argument) — so the extractor is shared rather than duplicated.  Emits
+ * one MOUNTS edge per router argument; cbm_pipeline_apply_router_mounts later
+ * turns those into full paths. */
 bool cbm_pipeline_is_router_mount(const char *callee_name);
+
+/* An inline function in handler position (`app.get('/x', async () => ...)`).
+ * Registration emitters use it to fall back to the enclosing scope for the
+ * HANDLES edge when the handler has no name to resolve. */
+bool cbm_pipeline_call_has_inline_handler(const CBMCall *call);
+
+/* Registration-shaped callee (router-like receiver or bare call).  Gates the
+ * inline-handler HANDLES fallback: an inline callback on a client-shaped
+ * receiver (`cache.get(path, cb)`) must not earn a HANDLES edge, or the
+ * pre-existing Route false positive becomes a fabricated cross-repo match. */
+bool cbm_pipeline_callee_is_router_shaped(const char *callee_name);
 
 /* True when a verb-suffixed path call registers a route rather than calling
  * one.  Registration is asserted, never assumed: a router-shaped receiver, or a
