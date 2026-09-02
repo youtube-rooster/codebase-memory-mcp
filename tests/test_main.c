@@ -787,6 +787,7 @@ extern void suite_integration(void);
 extern void suite_lang_contract(void);
 extern void suite_edge_imports(void);
 extern void suite_edge_structural(void);
+extern void suite_io_topology(void);
 extern void suite_lsp_resolution_probe(void);
 extern void suite_node_creation_probe(void);
 extern void suite_edge_types_probe(void);
@@ -1104,6 +1105,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(lang_contract);
     RUN_SELECTED_SUITE(edge_imports);
     RUN_SELECTED_SUITE(edge_structural);
+    RUN_SELECTED_SUITE(io_topology);
     RUN_SELECTED_SUITE(lsp_resolution_probe);
     RUN_SELECTED_SUITE(node_creation_probe);
     RUN_SELECTED_SUITE(edge_types_probe);

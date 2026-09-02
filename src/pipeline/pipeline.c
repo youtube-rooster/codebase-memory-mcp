@@ -914,6 +914,177 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
     cbm_ht_free(denied);
 }
 
+/* Rename Channel nodes whose name is a symbol (`Queues.ALL_PROCESSED`) to the
+ * literal the project binds it to.  The binding is collected from every file,
+ * because the constant is declared in a config module and used in workers that
+ * never see each other; left symbolic, a Python producer and the consumer that
+ * names the same queue as a literal are two unrelated nodes, and the pipeline
+ * they form reads as broken rather than as unresolved. */
+static void cbm_pipeline_resolve_symbolic_channels(cbm_gbuf_t *gbuf, CBMFileResult **result_cache,
+                                                   int file_count) {
+    CBMHashTable *bindings = cbm_ht_create(64);
+    if (!bindings) {
+        return;
+    }
+    enum { SYMBOL_BINDING_CAP = 4096, SYMBOL_CHAIN_MAX = 4 };
+    const char **binding_keys = calloc(SYMBOL_BINDING_CAP, sizeof(char *));
+    const char **binding_values = calloc(SYMBOL_BINDING_CAP, sizeof(char *));
+    int binding_count = 0;
+    if (!binding_keys || !binding_values) {
+        free((void *)binding_keys);
+        free((void *)binding_values);
+        cbm_ht_free(bindings);
+        return;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (!result_cache[i]) {
+            continue;
+        }
+        for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
+            const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
+            if (sr->kind != CBM_STRREF_SYMBOL || !sr->key_path || !sr->value) {
+                continue;
+            }
+            cbm_ht_set(bindings, sr->key_path, (void *)sr->value);
+            if (binding_count < SYMBOL_BINDING_CAP) {
+                binding_keys[binding_count] = sr->key_path;
+                binding_values[binding_count] = sr->value;
+                binding_count++;
+            }
+        }
+    }
+    /* `queue_name = Queues.MODERATION` binds a symbol to a symbol; follow the
+     * chain so the field lands on the literal the config module declares. */
+    for (int i = 0; i < binding_count; i++) {
+        for (int hop = 0; hop < SYMBOL_CHAIN_MAX; hop++) {
+            const char *next = (const char *)cbm_ht_get(bindings, binding_values[i]);
+            if (!next || next == binding_values[i]) {
+                break;
+            }
+            binding_values[i] = next;
+        }
+    }
+
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    int renamed = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Channel", &nodes, &count) != 0) {
+        cbm_ht_free(bindings);
+        return;
+    }
+
+    /* Snapshot before rewriting: upserting a node reallocates the label index
+     * the loop is walking. */
+    typedef struct {
+        const char *qn;
+        const char *file_path;
+        const char *symbol;
+        const char *literal;
+        char transport[CBM_SZ_64];
+    } chan_rename_t;
+    chan_rename_t *plan = count > 0 ? calloc((size_t)count, sizeof(chan_rename_t)) : NULL;
+    int planned = 0;
+    for (int i = 0; plan && i < count; i++) {
+        const char *name = nodes[i]->name;
+        if (!name || !strchr(name, '.')) {
+            continue;
+        }
+        const char *literal = (const char *)cbm_ht_get(bindings, name);
+        if (!literal || !literal[0] || strcmp(literal, name) == 0) {
+            continue;
+        }
+        plan[planned].qn = nodes[i]->qualified_name;
+        plan[planned].file_path = nodes[i]->file_path;
+        plan[planned].symbol = name;
+        plan[planned].literal = literal;
+        snprintf(plan[planned].transport, sizeof(plan[planned].transport), "unknown");
+        const char *tp = nodes[i]->properties_json
+                             ? strstr(nodes[i]->properties_json, "\"transport\":\"")
+                             : NULL;
+        if (tp) {
+            tp += strlen("\"transport\":\"");
+            const char *end = strchr(tp, '"');
+            if (end && (size_t)(end - tp) < sizeof(plan[planned].transport)) {
+                memcpy(plan[planned].transport, tp, (size_t)(end - tp));
+                plan[planned].transport[end - tp] = '\0';
+            }
+        }
+        planned++;
+    }
+
+    for (int i = 0; i < planned; i++) {
+        char esc[CBM_SZ_256];
+        cbm_json_escape(esc, sizeof(esc), plan[i].literal);
+        char esc_sym[CBM_SZ_256];
+        cbm_json_escape(esc_sym, sizeof(esc_sym), plan[i].symbol);
+        char props[CBM_SZ_512];
+        snprintf(props, sizeof(props), "{\"transport\":\"%s\",\"name\":\"%s\",\"symbol\":\"%s\"}",
+                 plan[i].transport, esc, esc_sym);
+        /* Same qualified name, so this updates the node in place rather than
+         * minting a second one; the symbol is kept as a property so the rename
+         * stays traceable to the code that spelled it. */
+        cbm_gbuf_upsert_node(gbuf, "Channel", plan[i].literal, plan[i].qn,
+                             plan[i].file_path ? plan[i].file_path : "", 0, 0, props);
+        renamed++;
+    }
+    free(plan);
+
+    /* A base class that consumes `self.<attr>` names a channel it cannot see:
+     * the queue is a field the subclass sets.  Bind the two by the field name
+     * and give the consume site an edge to each queue actually configured. */
+    for (int i = 0; i < count; i++) {
+        const char *name = nodes[i]->name;
+        if (!name || strncmp(name, "self.", 5) != 0) {
+            continue;
+        }
+        const char *attr = name + 5;
+        const cbm_gbuf_edge_t **in_edges = NULL;
+        int in_count = 0;
+        if (cbm_gbuf_find_edges_by_target_type(gbuf, nodes[i]->id, "LISTENS_ON", &in_edges,
+                                               &in_count) != 0 ||
+            in_count == 0) {
+            continue;
+        }
+        int64_t sources[16];
+        int nsources = 0;
+        for (int e = 0; e < in_count && nsources < 16; e++) {
+            sources[nsources++] = in_edges[e]->source_id;
+        }
+        for (int b = 0; b < binding_count; b++) {
+            const char *dot = strrchr(binding_keys[b], '.');
+            if (!dot || strcmp(dot + 1, attr) != 0) {
+                continue;
+            }
+            const char *literal = binding_values[b];
+            if (!literal || !literal[0] || strchr(literal, '.') == NULL) {
+                continue;
+            }
+            char cqn[CBM_SZ_512];
+            snprintf(cqn, sizeof(cqn), "__channel__rabbitmq__%s", literal);
+            char cprops[CBM_SZ_512];
+            char esc_l[CBM_SZ_256];
+            cbm_json_escape(esc_l, sizeof(esc_l), literal);
+            snprintf(cprops, sizeof(cprops),
+                     "{\"transport\":\"rabbitmq\",\"name\":\"%s\",\"via\":\"class_field\"}",
+                     esc_l);
+            int64_t cid = cbm_gbuf_upsert_node(gbuf, "Channel", literal, cqn, "", 0, 0, cprops);
+            for (int sidx = 0; cid > 0 && sidx < nsources; sidx++) {
+                cbm_gbuf_insert_edge(gbuf, sources[sidx], cid, "LISTENS_ON",
+                                     "{\"transport\":\"rabbitmq\",\"via\":\"class_field\"}");
+            }
+            renamed++;
+        }
+    }
+    free((void *)binding_keys);
+    free((void *)binding_values);
+    cbm_ht_free(bindings);
+    if (renamed > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", renamed);
+        cbm_log_info("pipeline.channels.symbols_resolved", "count", buf, NULL);
+    }
+}
+
 /* Run decorator_tags, configlink, and route matching passes. */
 typedef void (*predump_pass_fn)(cbm_pipeline_ctx_t *);
 static void predump_deco(cbm_pipeline_ctx_t *ctx) {
@@ -1089,6 +1260,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * code-side dispatch created it (e.g. a standalone scheduler manifest). */
     if (seq_cache && rc == 0) {
         cbm_pipeline_extract_infra_routes(p->gbuf, files, seq_cache, file_count);
+        cbm_pipeline_resolve_symbolic_channels(p->gbuf, seq_cache, file_count);
         cbm_pipeline_process_infra_bindings(p->gbuf, files, seq_cache, file_count);
     }
     if (seq_cache) {
@@ -1318,6 +1490,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
     cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
+    cbm_pipeline_resolve_symbolic_channels(p->gbuf, cache, file_count);
     cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {

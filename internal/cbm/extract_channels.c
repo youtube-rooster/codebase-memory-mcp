@@ -205,6 +205,22 @@ static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
 
 /* Python constant resolution: NAME = "value" (assignment node). */
 /* Name of the class body an assignment sits in, or NULL at module level. */
+/* Like py_enclosing_class_name, but does not stop at a method boundary: a
+ * worker sets `self.queue_name` in __init__, and that field belongs to the
+ * class even though the statement sits inside a function. */
+static const char *py_owning_class_name(CBMExtractCtx *ctx, TSNode node) {
+    TSNode parent = ts_node_parent(node);
+    while (!ts_node_is_null(parent)) {
+        if (strcmp(ts_node_type(parent), "class_definition") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+            return ts_node_is_null(name_node) ? NULL
+                                              : cbm_node_text(ctx->arena, name_node, ctx->source);
+        }
+        parent = ts_node_parent(parent);
+    }
+    return NULL;
+}
+
 static const char *py_enclosing_class_name(CBMExtractCtx *ctx, TSNode node) {
     TSNode parent = ts_node_parent(node);
     while (!ts_node_is_null(parent)) {
@@ -1045,6 +1061,13 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
         return;
     }
     const char *channel_name = extract_channel_name(ctx, args, consts);
+    if (!channel_name && ts_node_named_child_count(args) > 0) {
+        /* `client.consume(self.queue_name, handler)` — the queue arrives as a
+         * field, positionally.  Keeping the dotted spelling is what lets the
+         * project-wide pass bind it to the literal the subclass configured;
+         * dropped here, the consume site has no channel at all. */
+        channel_name = py_value_as_channel(ctx, ts_node_named_child(args, 0), consts);
+    }
     if (!channel_name) {
         return;
     }
@@ -1169,9 +1192,86 @@ static void py_listen_message_types(CBMExtractCtx *ctx, TSNode cmp) {
     }
 }
 
+/* Hand the file's `Class.ATTR = "literal"` bindings to the pipeline.  A queue
+ * named by such a constant is published in one file and consumed in another,
+ * and the constant is declared in a third; resolved only within a file, the
+ * producer and the consumer of one queue never carry the same name, and the
+ * edge between them cannot be drawn at all. */
+static void publish_symbol_bindings(CBMExtractCtx *ctx, const chan_const_table_t *tbl) {
+    for (int i = 0; i < tbl->count; i++) {
+        const char *name = tbl->items[i].name;
+        const char *value = tbl->items[i].value;
+        if (!name || !value || !value[0] || !strchr(name, '.')) {
+            continue;
+        }
+        CBMStringRef sr = {0};
+        sr.value = value;
+        sr.key_path = name;
+        sr.kind = CBM_STRREF_SYMBOL;
+        cbm_stringref_push(&ctx->result->string_refs, ctx->arena, sr);
+    }
+}
+
+/* Publish `class W: queue_name = Queues.MODERATION` as a binding of the dotted
+ * name `W.queue_name`.  A worker framework declares the consume loop once in a
+ * base class (`self.channel.basic_consume(queue=self.queue_name)`) and leaves
+ * the queue to a subclass field; read one file at a time, every worker built
+ * that way is a producer with no consumer, which reads as a broken pipeline
+ * rather than as a name the file cannot see. */
+static void publish_class_attr_bindings(CBMExtractCtx *ctx) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
+    ts_nstack_push(&stack, ctx->arena, ctx->root);
+
+    while (stack.count > 0) {
+        TSNode node = ts_nstack_pop(&stack);
+        if (strcmp(ts_node_type(node), "assignment") == 0) {
+            TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
+            TSNode right = ts_node_child_by_field_name(node, TS_FIELD("right"));
+            const char *rk = ts_node_is_null(right) ? "" : ts_node_type(right);
+            const char *lk = ts_node_is_null(left) ? "" : ts_node_type(left);
+            /* `self.queue_name = Queues.MODERATION` in __init__ is the shape a
+             * worker actually uses; a bare class-body assignment is the other. */
+            TSNode target = left;
+            bool self_attr = false;
+            if (strcmp(lk, "attribute") == 0) {
+                TSNode obj = ts_node_child_by_field_name(left, TS_FIELD("object"));
+                TSNode att = ts_node_child_by_field_name(left, TS_FIELD("attribute"));
+                char *obj_text = ts_node_is_null(obj) ? NULL : cbm_node_text(ctx->arena, obj, ctx->source);
+                if (obj_text && strcmp(obj_text, "self") == 0 && !ts_node_is_null(att)) {
+                    target = att;
+                    self_attr = true;
+                }
+            }
+            if ((strcmp(lk, "identifier") == 0 || self_attr) &&
+                (strcmp(rk, "identifier") == 0 || strcmp(rk, "attribute") == 0)) {
+                char *attr = cbm_node_text(ctx->arena, target, ctx->source);
+                const char *owner = self_attr ? py_owning_class_name(ctx, node)
+                                              : py_enclosing_class_name(ctx, node);
+                char *value = cbm_node_text(ctx->arena, right, ctx->source);
+                if (attr && owner && value && value[0] && py_is_channel_kwarg(attr)) {
+                    CBMStringRef sr = {0};
+                    sr.value = value;
+                    sr.key_path = cbm_arena_sprintf(ctx->arena, "%s.%s", owner, attr);
+                    sr.kind = CBM_STRREF_SYMBOL;
+                    if (sr.key_path) {
+                        cbm_stringref_push(&ctx->result->string_refs, ctx->arena, sr);
+                    }
+                }
+            }
+        }
+        uint32_t count = ts_node_child_count(node);
+        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
+            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+        }
+    }
+}
+
 static void extract_channels_python(CBMExtractCtx *ctx) {
     chan_const_table_t consts = {0};
     scan_string_consts_python(ctx, &consts);
+    publish_symbol_bindings(ctx, &consts);
+    publish_class_attr_bindings(ctx);
 
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
