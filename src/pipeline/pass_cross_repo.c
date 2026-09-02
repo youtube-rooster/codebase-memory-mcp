@@ -806,7 +806,17 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
                            "JOIN nodes fn ON fn.id = e.source_id "
                            "WHERE n.project = ?1 AND n.name = ?2 AND n.label = 'Channel' "
                            "AND (?3 = '' OR "
-                           "coalesce(json_extract(n.properties,'$.transport'),'') = ?3) LIMIT 1",
+                           "coalesce(json_extract(n.properties,'$.transport'),'') = ?3 OR "
+                           /* A gateway broadcasts a typed envelope with a
+                            * variable event name, so the wire name survives
+                            * only as the payload discriminator; the client
+                            * listens for that same name as a socket event.
+                            * They are the two ends of one socket, and pairing
+                            * them is narrow on purpose — no other transport
+                            * joins this equivalence. */
+                           "(?3 IN ('socketio','message_type') AND "
+                           " coalesce(json_extract(n.properties,'$.transport'),'') IN "
+                           " ('socketio','message_type'))) LIMIT 1",
                            CBM_NOT_FOUND, &tq, NULL) != SQLITE_OK) {
         return CBM_STORE_ERR;
     }

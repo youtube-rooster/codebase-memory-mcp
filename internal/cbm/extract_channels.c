@@ -518,7 +518,30 @@ static bool js_is_listen_method(const char *name) {
 }
 
 /* Classify receiver for Socket.IO / EventEmitter / WebSocket. */
+static const char *js_classify_receiver_depth(CBMExtractCtx *ctx, TSNode object_node, int depth);
+
 static const char *js_classify_receiver(CBMExtractCtx *ctx, TSNode object_node) {
+    return js_classify_receiver_depth(ctx, object_node, 0);
+}
+
+static const char *js_classify_receiver_depth(CBMExtractCtx *ctx, TSNode object_node, int depth) {
+    /* `io.to(room).emit(...)` is THE socket.io broadcast idiom, and the room
+     * scoping puts a call between the handle and the emit: classified on the
+     * text tail, the receiver reads as `to(room)` and matches nothing, so every
+     * room-scoped broadcast was invisible while the direct `socket.emit` next
+     * to it resolved.  A chained call inherits the classification of the handle
+     * it was chained onto. */
+    enum { JS_RECEIVER_CHAIN_MAX = 4 };
+    if (depth < JS_RECEIVER_CHAIN_MAX && strcmp(ts_node_type(object_node), "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(object_node, TS_FIELD("function"));
+        if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
+            TSNode inner = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+            if (!ts_node_is_null(inner)) {
+                return js_classify_receiver_depth(ctx, inner, depth + 1);
+            }
+        }
+        return NULL;
+    }
     char *text = cbm_node_text(ctx->arena, object_node, ctx->source);
     if (!text) {
         return NULL;
@@ -778,11 +801,17 @@ static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
     }
     /* The discriminator travels with the payload, so it is recorded even when
      * the queue name itself stays unresolved (config-driven or computed). */
+    const char *channel_name = extract_channel_name(ctx, args, consts);
     if (direction == CBM_CHANNEL_EMIT &&
-        (strcmp(transport, "rabbitmq") == 0 || strcmp(transport, "kafka") == 0)) {
+        (strcmp(transport, "rabbitmq") == 0 || strcmp(transport, "kafka") == 0 ||
+         /* A gateway broadcasts one socket event carrying a typed envelope
+          * (`emit("message", { type, payload })`).  The event name says only
+          * "this is a message"; the `type` is what the client listens for, so
+          * without it the gateway records no wire name a consumer could match. */
+         (strcmp(transport, "socketio") == 0 && channel_name &&
+          strcmp(channel_name, "message") == 0))) {
         js_emit_message_types(ctx, args);
     }
-    const char *channel_name = extract_channel_name(ctx, args, consts);
     if (!channel_name) {
         return;
     }

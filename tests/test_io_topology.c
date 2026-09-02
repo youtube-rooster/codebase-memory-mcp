@@ -282,12 +282,12 @@ TEST(js_client_call_in_a_frontend_is_not_a_route) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * 5. One socket, one name.  A gateway that emits a typed envelope and a
- *    client that listens for that type are the two ends of one channel;
- *    classifying them under different transports splits the node in two
- *    and the edge is never drawn.
+ * 5. A gateway broadcasts ONE socket event carrying a typed envelope,
+ *    so the event name says only "this is a message".  The type inside
+ *    is the wire name the client listens for; unrecorded, the gateway
+ *    publishes nothing a consumer could ever be matched against.
  * ══════════════════════════════════════════════════════════════════ */
-TEST(socketio_listen_and_message_type_emit_share_one_channel) {
+TEST(socketio_envelope_emit_records_the_message_type) {
     const IoFile f[] = {
         {"package.json", "{\"name\":\"gw\",\"dependencies\":{\"socket.io\":\"^4.0.0\"}}\n"},
         {"src/gateway.ts", "import { Server } from 'socket.io'\n"
@@ -295,22 +295,89 @@ TEST(socketio_listen_and_message_type_emit_share_one_channel) {
                            "export function push(room: string, payload: unknown) {\n"
                            "  io.to(room).emit('message', { type: 'content_engine', payload })\n"
                            "}\n"},
-        {"src/client.ts", "import { io } from 'socket.io-client'\n"
-                          "const socket = io()\n"
-                          "socket.on('content_engine', (p) => console.log(p))\n"},
     };
     IoProj p;
-    ASSERT_TRUE(io_index(&p, f, 3));
-    char *resp = io_query(&p, "MATCH (c:Channel) WHERE c.name = 'content_engine' RETURN c.name");
-    /* Two rows means two nodes: the emit side and the listen side never met. */
-    int split = resp && strstr(resp, "rows: 2") != NULL;
+    ASSERT_TRUE(io_index(&p, f, 2));
+    int ok = io_query_has(&p,
+                          "MATCH ()-[:EMITS]->(c:Channel) WHERE c.transport = 'message_type' "
+                          "RETURN c.name",
+                          "content_engine");
+    io_cleanup(&p);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * 6. `io.to(room).emit(...)` is the socket.io broadcast idiom.  Read on
+ *    the text of the receiver it looks like a call to `to`, so every
+ *    room-scoped broadcast a gateway makes went unrecorded while the
+ *    direct `socket.emit` on the line above it resolved.
+ * ══════════════════════════════════════════════════════════════════ */
+TEST(js_room_scoped_socketio_broadcast_is_an_emit) {
+    const IoFile f[] = {
+        {"package.json", "{\"name\":\"gw\",\"dependencies\":{\"socket.io\":\"^4.0.0\"}}\n"},
+        {"src/gateway.ts", "import { Server } from 'socket.io'\n"
+                           "const io = new Server()\n"
+                           "export function push(liveId: string, payload: unknown) {\n"
+                           "  io.to(`members:${liveId}`).emit('member_comments', payload)\n"
+                           "}\n"},
+    };
+    IoProj p;
+    ASSERT_TRUE(io_index(&p, f, 2));
+    int ok = io_query_has(&p,
+                          "MATCH ()-[:EMITS]->(c:Channel) WHERE c.transport = 'socketio' "
+                          "RETURN c.name",
+                          "member_comments");
+    io_cleanup(&p);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * 7. Cross-repo: a gateway that emits a typed envelope and a client
+ *    that listens for that type are the two ends of one socket.  Held
+ *    to exact transport equality, the emit is filed as a message type
+ *    and the listen as a socket event, and the edge is never drawn —
+ *    which reads as two services that do not talk.
+ * ══════════════════════════════════════════════════════════════════ */
+TEST(cross_repo_socketio_listen_matches_message_type_emit) {
+    const IoFile gw[] = {
+        {"package.json", "{\"name\":\"gw\",\"dependencies\":{\"socket.io\":\"^4.0.0\"}}\n"},
+        {"src/gateway.ts", "import { Server } from 'socket.io'\n"
+                           "const io = new Server()\n"
+                           "export function push(room: string, event: string, p: unknown) {\n"
+                           "  io.to(room).emit('message', { type: 'content_engine', payload: p })\n"
+                           "}\n"},
+    };
+    const IoFile front[] = {
+        {"package.json",
+         "{\"name\":\"front\",\"dependencies\":{\"socket.io-client\":\"^4.0.0\"}}\n"},
+        {"src/live.ts", "import { io } from 'socket.io-client'\n"
+                        "const socket = io()\n"
+                        "socket.on('content_engine', (p) => console.log(p))\n"},
+    };
+    IoProj g;
+    IoProj f;
+    ASSERT_TRUE(io_index(&g, gw, 2));
+    ASSERT_TRUE(io_index(&f, front, 2));
+
+    char args[1400];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"%s\"]}",
+             g.tmpdir, f.project);
+    char *resp = cbm_mcp_handle_tool(g.srv, "index_repository", args);
+    int linked = resp && strstr(resp, "\"cross_channel\":0") == NULL &&
+                 strstr(resp, "cross_channel") != NULL;
+    if (!linked && resp) {
+        fprintf(stderr, "      └─ cross-repo: %s\n", resp);
+    }
     if (resp) {
         free(resp);
     }
-    int present = io_query_has(&p, "MATCH (c:Channel) RETURN c.name", "content_engine");
-    io_cleanup(&p);
-    ASSERT_TRUE(present);
-    ASSERT_TRUE(!split);
+    io_cleanup(&f);
+    io_cleanup(&g);
+    ASSERT_TRUE(linked);
     PASS();
 }
 
@@ -320,5 +387,7 @@ SUITE(io_topology) {
     RUN_TEST(py_class_constant_channel_resolves_to_its_literal);
     RUN_TEST(py_worker_subclass_queue_field_is_a_listen);
     RUN_TEST(js_client_call_in_a_frontend_is_not_a_route);
-    RUN_TEST(socketio_listen_and_message_type_emit_share_one_channel);
+    RUN_TEST(socketio_envelope_emit_records_the_message_type);
+    RUN_TEST(js_room_scoped_socketio_broadcast_is_an_emit);
+    RUN_TEST(cross_repo_socketio_listen_matches_message_type_emit);
 }
