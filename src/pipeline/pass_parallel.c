@@ -688,7 +688,10 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
                              (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
-    if (def->route_path && def->route_path[0] != '\0') {
+    /* A route decorated inside a test file is a fixture standing in for the
+     * service, not a surface the service exposes. */
+    const char *route_owner = def->file_path ? def->file_path : fi->rel_path;
+    if (def->route_path && def->route_path[0] != '\0' && !cbm_is_test_path(route_owner)) {
         const char *rm = def->route_method ? def->route_method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];
@@ -702,7 +705,8 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
         char hprops[CBM_SZ_512];
         char esc_h[CBM_SZ_512];
         cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
-        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
+        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}",
+                 esc_h, route_owner);
         cbm_gbuf_insert_edge(ws->local_gbuf, func_id, route_id, "HANDLES", hprops);
     }
 }
@@ -2174,6 +2178,11 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
                                     const char *handler_ref, const char *module_qn,
                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                                     const char **ik, const char **iv, int ic) {
+    /* A test file registers routes on a throwaway app to exercise handlers;
+     * those are fixtures, not the surface the service exposes. */
+    if (source && source->file_path && cbm_is_test_path(source->file_path)) {
+        return;
+    }
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];

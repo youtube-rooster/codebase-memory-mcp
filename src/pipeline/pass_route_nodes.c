@@ -439,6 +439,14 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         return 0;
     }
 
+    /* A route decorated inside a test file is a fixture standing in for the
+     * service, not a surface the service exposes.  Counted, it makes the
+     * biggest route declarer of a repo a test module. */
+    if (strstr(func->properties_json, "\"is_test\":true") ||
+        (func->file_path && cbm_is_test_path(func->file_path))) {
+        return 0;
+    }
+
     char path[CBM_SZ_256];
     if (!extract_json_prop(func->properties_json, "route_path", path, sizeof(path))) {
         return 0;
@@ -472,9 +480,13 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         }
     }
 
+    /* Same property the call-registration path writes: without it the route
+     * belongs to the repo and not to the file, and every module sharing a
+     * directory inherits every route the directory declares. */
     char hprops[CBM_SZ_512];
-    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}",
-             func->qualified_name ? func->qualified_name : "");
+    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}",
+             func->qualified_name ? func->qualified_name : "",
+             func->file_path ? func->file_path : "");
     cbm_gbuf_insert_edge(gb, func->id, route_id, "HANDLES", hprops);
     return SKIP_ONE;
 }

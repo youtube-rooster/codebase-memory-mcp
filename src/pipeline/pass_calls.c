@@ -198,6 +198,12 @@ static void free_import_map(const char **keys, const char **vals, int count) {
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
                                       const char **imp_keys, const char **imp_vals, int imp_count) {
+    /* A test file registers routes on a throwaway app to exercise handlers.
+     * Those are fixtures, not surface: counted, the biggest route declarer of
+     * a repo becomes a test module. */
+    if (source_node && source_node->file_path && cbm_is_test_path(source_node->file_path)) {
+        return;
+    }
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
