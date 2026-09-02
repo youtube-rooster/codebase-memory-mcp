@@ -93,6 +93,28 @@ static const char *literal_from_first_child(CBMExtractCtx *ctx, TSNode node) {
     return NULL;
 }
 
+/* `env.FOO`, `process.env.FOO` → "FOO".  A queue URL is configuration: the
+ * literal differs per environment, the env key does not.  The key is therefore
+ * the only name a producer in one repo and a consumer in another actually
+ * share, so it is what the channel is called when the URL is not literal. */
+static const char *js_env_key_from_node(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "member_expression") != 0) {
+        return NULL;
+    }
+    TSNode object = ts_node_child_by_field_name(node, TS_FIELD("object"));
+    TSNode property = ts_node_child_by_field_name(node, TS_FIELD("property"));
+    if (ts_node_is_null(object) || ts_node_is_null(property)) {
+        return NULL;
+    }
+    char *obj_text = cbm_node_text(ctx->arena, object, ctx->source);
+    if (!obj_text || (strcmp(obj_text, "env") != 0 && strcmp(obj_text, "process.env") != 0 &&
+                      strcmp(obj_text, "Deno.env") != 0)) {
+        return NULL;
+    }
+    char *key = cbm_node_text(ctx->arena, property, ctx->source);
+    return (key && key[0]) ? key : NULL;
+}
+
 /* ── Constant resolution table ──────────────────────────────────── */
 
 /* Walk the whole tree once and collect `const IDENT = "value"` bindings so
@@ -145,6 +167,33 @@ static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
                 if (lhs_text && unq_val && tbl->count < CHAN_CONST_CAP) {
                     tbl->items[tbl->count].name = lhs_text;
                     tbl->items[tbl->count].value = unq_val;
+                    tbl->count++;
+                }
+            }
+        }
+
+        /* `constructor(private readonly topicArn = env.BUS_EVENTS_TOPIC_ARN)` and
+         * `private readonly queueUrl = env.Q` — the adapter reads the env once, at
+         * the declaration, and every call site afterwards says only
+         * `this.topicArn`.  Without binding the field to its env key the queue the
+         * whole adapter exists to address resolves to nothing. */
+        if (strcmp(kind, "required_parameter") == 0 || strcmp(kind, "optional_parameter") == 0 ||
+            strcmp(kind, "public_field_definition") == 0) {
+            /* TS_FIELD expands to two arguments, so the field name cannot be
+             * chosen with a conditional expression. */
+            TSNode name_node;
+            if (strcmp(kind, "public_field_definition") == 0) {
+                name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            } else {
+                name_node = ts_node_child_by_field_name(node, TS_FIELD("pattern"));
+            }
+            TSNode value_node = ts_node_child_by_field_name(node, TS_FIELD("value"));
+            const char *env_key = js_env_key_from_node(ctx, value_node);
+            if (!ts_node_is_null(name_node) && env_key && tbl->count < CHAN_CONST_CAP) {
+                char *field = cbm_node_text(ctx->arena, name_node, ctx->source);
+                if (field && field[0]) {
+                    tbl->items[tbl->count].name = cbm_arena_sprintf(ctx->arena, "this.%s", field);
+                    tbl->items[tbl->count].value = env_key;
                     tbl->count++;
                 }
             }
@@ -285,6 +334,132 @@ static const char *extract_channel_name(CBMExtractCtx *ctx, TSNode args,
         }
     }
     return channel_name;
+}
+
+/* ── AWS SDK v3 command channels ─────────────────────────────────── */
+
+/* v3 gives the client exactly one verb: `client.send(new XxxCommand({...}))`.
+ * The receiver is an opaque handle whose tail reads as "client" — which
+ * classifies as socketio — and the first argument is a `new_expression`, not a
+ * string, so the call resolved to no channel name and was dropped in silence.
+ * The command CLASS is what pins transport and direction, the same way
+ * `sendToQueue` pins amqplib.  Only messaging commands qualify: S3 and DynamoDB
+ * ride the identical shape, and calling a bucket a channel would invent an edge
+ * between every repo that reads it. */
+static const struct {
+    const char *command;
+    const char *transport;
+    CBMChannelDirection direction;
+    const char *name_key;
+} aws_v3_command_table[] = {
+    {"SendMessageCommand", "sqs", CBM_CHANNEL_EMIT, "QueueUrl"},
+    {"SendMessageBatchCommand", "sqs", CBM_CHANNEL_EMIT, "QueueUrl"},
+    {"ReceiveMessageCommand", "sqs", CBM_CHANNEL_LISTEN, "QueueUrl"},
+    {"PublishCommand", "sns", CBM_CHANNEL_EMIT, "TopicArn"},
+    {"PublishBatchCommand", "sns", CBM_CHANNEL_EMIT, "TopicArn"},
+    {"PutEventsCommand", "eventbridge", CBM_CHANNEL_EMIT, "EventBusName"},
+    {NULL, NULL, CBM_CHANNEL_EMIT, NULL},
+};
+
+/* Value of `key` in an object literal, or 0 when the key is absent. */
+static int js_object_value_for_key(CBMExtractCtx *ctx, TSNode object, const char *key,
+                                   TSNode *out) {
+    uint32_t n = ts_node_named_child_count(object);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_named_child(object, i);
+        if (strcmp(ts_node_type(child), "pair") != 0) {
+            continue;
+        }
+        TSNode k = ts_node_child_by_field_name(child, TS_FIELD("key"));
+        if (ts_node_is_null(k)) {
+            continue;
+        }
+        char *k_text = cbm_node_text(ctx->arena, k, ctx->source);
+        const char *unq = unquote_string(ctx->arena, k_text);
+        const char *name = unq ? unq : k_text;
+        if (name && strcmp(name, key) == 0) {
+            TSNode v = ts_node_child_by_field_name(child, TS_FIELD("value"));
+            if (ts_node_is_null(v)) {
+                return 0;
+            }
+            *out = v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Literal → module constant / env-bound field → env key. */
+static const char *js_channel_name_from_value(CBMExtractCtx *ctx, TSNode value,
+                                              const chan_const_table_t *consts) {
+    const char *name = literal_from_arg(ctx, value);
+    if (name) {
+        return name;
+    }
+    const char *kind = ts_node_type(value);
+    if (consts && (strcmp(kind, "identifier") == 0 || strcmp(kind, "member_expression") == 0)) {
+        char *ident = cbm_node_text(ctx->arena, value, ctx->source);
+        const char *resolved = resolve_identifier(consts, ident);
+        if (resolved) {
+            return resolved;
+        }
+    }
+    return js_env_key_from_node(ctx, value);
+}
+
+/* 1 when the call is an AWS SDK v3 messaging command, with the channel filled. */
+static int js_aws_v3_command_channel(CBMExtractCtx *ctx, TSNode call, const char *method,
+                                     const chan_const_table_t *consts, const char **transport,
+                                     CBMChannelDirection *direction, const char **name) {
+    if (!method || strcmp(method, "send") != 0) {
+        return 0;
+    }
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return 0;
+    }
+    TSNode first = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(first), "new_expression") != 0) {
+        return 0;
+    }
+    TSNode ctor = ts_node_child_by_field_name(first, TS_FIELD("constructor"));
+    if (ts_node_is_null(ctor)) {
+        return 0;
+    }
+    char *ctor_name = cbm_node_text(ctx->arena, ctor, ctx->source);
+    if (!ctor_name) {
+        return 0;
+    }
+    int idx = -1;
+    for (int i = 0; aws_v3_command_table[i].command != NULL; i++) {
+        if (strcmp(aws_v3_command_table[i].command, ctor_name) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        return 0;
+    }
+    TSNode cargs = ts_node_child_by_field_name(first, TS_FIELD("arguments"));
+    if (ts_node_is_null(cargs) || ts_node_named_child_count(cargs) == 0) {
+        return 0;
+    }
+    TSNode payload = ts_node_named_child(cargs, 0);
+    if (strcmp(ts_node_type(payload), "object") != 0) {
+        return 0;
+    }
+    TSNode value;
+    if (!js_object_value_for_key(ctx, payload, aws_v3_command_table[idx].name_key, &value)) {
+        return 0;
+    }
+    const char *resolved = js_channel_name_from_value(ctx, value, consts);
+    if (!resolved || !resolved[0]) {
+        return 0;
+    }
+    *transport = aws_v3_command_table[idx].transport;
+    *direction = aws_v3_command_table[idx].direction;
+    *name = resolved;
+    return 1;
 }
 
 /* ── Emit helper ─────────────────────────────────────────────────── */
@@ -511,6 +686,18 @@ static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
     }
 
     char *method = cbm_node_text(ctx->arena, property, ctx->source);
+
+    /* Checked before the receiver: an AWS v3 handle is named `client`, which
+     * classifies as socketio, so asking the receiver first answers wrongly. */
+    const char *aws_transport = NULL;
+    const char *aws_name = NULL;
+    CBMChannelDirection aws_direction = CBM_CHANNEL_EMIT;
+    if (js_aws_v3_command_channel(ctx, call, method, consts, &aws_transport, &aws_direction,
+                                  &aws_name)) {
+        push_channel(ctx, aws_name, aws_transport, aws_direction, call);
+        return;
+    }
+
     const char *transport = js_classify_receiver(ctx, object);
     /* sendToQueue/assertQueue are amqplib-exclusive method names: the method
      * alone pins the transport, so a wrapper whose name we cannot classify
