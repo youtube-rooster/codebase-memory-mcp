@@ -600,10 +600,13 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         return cr_match_finish(ctx, 0, true);
     }
 
-    /* Find all HTTP_CALLS edges in source project */
+    /* Find all HTTP_CALLS edges in source project, carrying the caller's file:
+     * a suite seeds sample paths as string literals and the matcher cannot tell
+     * those from a client call without knowing where the call was written. */
     sqlite3_stmt *s = NULL;
     if (sqlite3_prepare_v2(src_db,
-                           "SELECT e.source_id, e.target_id, e.properties FROM edges e "
+                           "SELECT e.source_id, e.target_id, e.properties, n.file_path FROM edges e "
+                           "LEFT JOIN nodes n ON n.id = e.source_id "
                            "WHERE e.project = ?1 AND e.type = 'HTTP_CALLS' ORDER BY e.id",
                            CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
         return cr_match_finish(ctx, 0, true);
@@ -623,6 +626,11 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
         int64_t caller_id = sqlite3_column_int64(s, 0);
         int64_t route_id = sqlite3_column_int64(s, SKIP_ONE);
         const char *props = (const char *)sqlite3_column_text(s, PAIR_LEN);
+        const char *caller_file = (const char *)sqlite3_column_text(s, CR_COL_3);
+
+        if (caller_file && cbm_is_test_path(caller_file)) {
+            continue;
+        }
 
         char url_path[CBM_SZ_256] = {0};
         char method[CBM_SZ_32] = {0};
@@ -666,6 +674,9 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
             break;
         }
         if (handler_id == 0) {
+            continue;
+        }
+        if (cbm_is_test_path(handler_file)) {
             continue;
         }
 
@@ -848,12 +859,18 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
     if (step_rc == SQLITE_DONE) {
         return 0;
     }
+    if (cbm_is_test_path(listener_file)) {
+        return 0;
+    }
 
     char caller_name[CBM_SZ_256] = {0};
     char caller_file[CBM_SZ_512] = {0};
     if (!lookup_node_info(cbm_store_get_db(src_store), emitter_id, caller_name, sizeof(caller_name),
                           caller_file, sizeof(caller_file))) {
         return CBM_STORE_ERR;
+    }
+    if (cbm_is_test_path(caller_file)) {
+        return 0;
     }
 
     /* Forward edge: emitter → local Channel */

@@ -72,9 +72,11 @@ static bool cross_repo_create_project(const cross_repo_fixture_t *fixture, const
 
 /* Seed one HTTP_CALLS/HANDLES pair into two exact project stores. The suffix
  * keeps node QNs unique when a source is linked to more than one target. */
-static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
-                                      const char *source_project, const char *target_project,
-                                      const char *route_path, const char *suffix) {
+static bool cross_repo_seed_http_pair_files(const cross_repo_fixture_t *fixture,
+                                            const char *source_project,
+                                            const char *target_project, const char *route_path,
+                                            const char *suffix, const char *caller_file,
+                                            const char *handler_file) {
     char source_path[512];
     char target_path[512];
     if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path)) ||
@@ -109,12 +111,12 @@ static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
                          .label = "Function",
                          .name = "call_remote",
                          .qualified_name = caller_qn,
-                         .file_path = "client.c"};
+                         .file_path = caller_file};
     cbm_node_t local_route = {.project = source_project,
                               .label = "Route",
                               .name = route_name,
                               .qualified_name = local_route_qn,
-                              .file_path = "client.c"};
+                              .file_path = caller_file};
     int64_t caller_id = ok ? cbm_store_upsert_node(source, &caller) : 0;
     int64_t local_route_id = ok ? cbm_store_upsert_node(source, &local_route) : 0;
     cbm_edge_t http_call = {.project = source_project,
@@ -128,12 +130,12 @@ static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
                                .label = "Route",
                                .name = route_name,
                                .qualified_name = target_route_qn,
-                               .file_path = "server.c"};
+                               .file_path = handler_file};
     cbm_node_t handler = {.project = target_project,
                           .label = "Function",
                           .name = "handle_remote",
                           .qualified_name = handler_qn,
-                          .file_path = "server.c"};
+                          .file_path = handler_file};
     int64_t target_route_id = ok ? cbm_store_upsert_node(target, &target_route) : 0;
     int64_t handler_id = ok ? cbm_store_upsert_node(target, &handler) : 0;
     cbm_edge_t handles = {.project = target_project,
@@ -177,6 +179,13 @@ static int cross_repo_count_edges(const cross_repo_fixture_t *fixture, const cha
     int count = cbm_store_count_edges_by_type(store, project, edge_type);
     cbm_store_close(store);
     return count;
+}
+
+static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
+                                      const char *source_project, const char *target_project,
+                                      const char *route_path, const char *suffix) {
+    return cross_repo_seed_http_pair_files(fixture, source_project, target_project, route_path,
+                                           suffix, "client.c", "server.c");
 }
 
 TEST(cross_repo_null_target_fails_without_dereference) {
@@ -624,7 +633,115 @@ TEST(cross_channel_same_name_different_transport_does_not_link) {
     PASS();
 }
 
+/* A test fixture is not a caller. A suite seeds sample routes ("/admin/users")
+ * and temp paths ("/tmp/test") as string literals to exercise the extractors;
+ * the matcher read those literals as real traffic and wired them to whatever
+ * project happened to serve a route of the same name. Measured on a 23-repo
+ * workspace: 141 of the 145 cross edges leaving cbm's own project came from
+ * tests/, 135 of them from the single literal "/tmp/test". */
+TEST(cross_repo_ignores_http_call_declared_in_a_test_file) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair_files(&fixture, "testfile-source", "testfile-target",
+                                                 "/admin/users", "s", "tests/test_pipeline.c",
+                                                 "server.c");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed test-file caller fixture");
+    }
+
+    const char *target = "testfile-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("testfile-source", &target, 1);
+    int emitted = cross_repo_count_edges(&fixture, "testfile-source", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 0);
+    ASSERT_EQ(emitted, 0);
+    PASS();
+}
+
+/* The mirror case: a Route that only exists inside the target's own suite is
+ * not a service endpoint, so no real client can be calling it. */
+TEST(cross_repo_ignores_route_declared_in_a_test_file) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair_files(&fixture, "testroute-source", "testroute-target",
+                                                 "/admin/users", "s", "client.c",
+                                                 "tests/test_server.c");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed test-file route fixture");
+    }
+
+    const char *target = "testroute-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("testroute-source", &target, 1);
+    int emitted = cross_repo_count_edges(&fixture, "testroute-source", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.http_edges, 0);
+    ASSERT_EQ(emitted, 0);
+    PASS();
+}
+
+/* The same fixture problem on the broker side: a suite that publishes to a
+ * queue name to exercise its own adapter is not a producer of that queue. */
+TEST(cross_channel_ignores_emitter_in_a_test_file) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_channel_side(&fixture, "chan-test-source", "new_comment",
+                                              "message_type", "EMITS", "tests/test_worker.py") &&
+                 cross_repo_seed_channel_side(&fixture, "chan-test-target", "new_comment",
+                                              "message_type", "LISTENS_ON", "consumer.ts");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed test-file emitter fixture");
+    }
+
+    const char *target = "chan-test-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("chan-test-source", &target, 1);
+    int src_edges = cross_repo_count_edges(&fixture, "chan-test-source", "CROSS_CHANNEL");
+    int tgt_edges = cross_repo_count_edges(&fixture, "chan-test-target", "CROSS_CHANNEL");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 0);
+    ASSERT_EQ(src_edges, 0);
+    ASSERT_EQ(tgt_edges, 0);
+    PASS();
+}
+
+/* The mirror case on the broker side. cross_channel_same_name_and_transport_links
+ * is the control: the identical fixture outside tests/ still links, so a filter
+ * that dropped everything cannot pass green. */
+TEST(cross_channel_ignores_listener_in_a_test_file) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_channel_side(&fixture, "chan-tlist-source", "new_comment",
+                                              "message_type", "EMITS", "publish.py") &&
+                 cross_repo_seed_channel_side(&fixture, "chan-tlist-target", "new_comment",
+                                              "message_type", "LISTENS_ON",
+                                              "src/__tests__/consumer.test.ts");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed test-file listener fixture");
+    }
+
+    const char *target = "chan-tlist-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("chan-tlist-source", &target, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 0);
+    PASS();
+}
+
 SUITE(cross_repo) {
+    RUN_TEST(cross_repo_ignores_http_call_declared_in_a_test_file);
+    RUN_TEST(cross_repo_ignores_route_declared_in_a_test_file);
+    RUN_TEST(cross_channel_ignores_emitter_in_a_test_file);
+    RUN_TEST(cross_channel_ignores_listener_in_a_test_file);
     RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
