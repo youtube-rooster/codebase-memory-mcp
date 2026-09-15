@@ -260,6 +260,11 @@ echo "=== parallel test run: $NSHARD of $NSUITES suites (shard ${SHARD_INDEX}/${
 run_wave() {
     local suite_file="$1"
     local jobs="$2"
+    local isolate="${3:-}"
+    local isolate_flags=()
+    if [ "$isolate" = "isolate" ]; then
+        isolate_flags=(--isolate-namespace)
+    fi
     if ! python3 "$SCHEDULER" \
         --suite-file "$suite_file" \
         --log-dir "$LOGDIR" \
@@ -268,6 +273,7 @@ run_wave() {
         --timeout "${CBM_SUITE_TIMEOUT:-900}" \
         --slow-timeout "${CBM_SUITE_TIMEOUT_SLOW:-3600}" \
         --kill-grace 15 \
+        ${isolate_flags[@]+"${isolate_flags[@]}"} \
         "$RUNNER"; then
         echo "FAIL: parallel suite scheduler infrastructure failed" >&2
         exit 1
@@ -304,6 +310,58 @@ while IFS= read -r sname; do
         echo "$sname" >> "$FLEX_FILE"
     fi
 done < "$SER_FILE"
+# The EXCL group splits along its two DIFFERENT serial reasons:
+#   - The daemon-family suites (plus cli/mcp, which drive daemon one-shots)
+#     were serial because they all rendezvous through the shared per-account
+#     runtime namespace and the default cache. That is a NAMESPACE problem,
+#     not a cost problem: the scheduler's --isolate-namespace gives each
+#     suite a private CBM_RUNTIME_DIR + CBM_CACHE_DIR (both resolved at the
+#     single product funnel, cbm_daemon_bootstrap_endpoint_new / the cache
+#     lookup, and inherited by every re-exec), so a bounded overlap shares
+#     no socket, lock, or graph DB. Heaviest-first order keeps the wave's
+#     wall clock pinned to its longest member (cli, ~200s native) instead of
+#     whatever --list-suites order would stack last.
+#   - extraction stays strictly serial AND alone: it measures a scaling
+#     ratio, and any concurrent load — even one isolated sibling — inflates
+#     the ratio itself (see the calibration note above). Its verdict must be
+#     a function of the code, not of the schedule.
+# The overlap engages only where cores are plentiful: the saturated 3-4 core
+# CI runners keep the strictly-serial schedule (jobs=1, no env delta — their
+# historical failure mode was readiness-DEADLINE starvation, which namespace
+# isolation does not fix; only a quiet machine does).
+DAEMON_FILE="$LOGDIR/suites-tail-daemon.txt"
+EXTRACT_FILE="$LOGDIR/suites-tail-extraction.txt"
+: > "$DAEMON_FILE"
+: > "$EXTRACT_FILE"
+for sname in cli daemon_runtime daemon_frontend mcp index_supervisor \
+    daemon_application daemon_bootstrap daemon_ipc; do
+    grep -qx "$sname" "$EXCL_FILE" && echo "$sname" >> "$DAEMON_FILE"
+done
+grep -qx extraction "$EXCL_FILE" && echo extraction >> "$EXTRACT_FILE"
+if [ "$(sort "$DAEMON_FILE" "$EXTRACT_FILE")" != "$(sort "$EXCL_FILE")" ]; then
+    echo "FAIL: EXCL tail split lost or invented a suite" >&2
+    exit 1
+fi
+if [ -n "${CBM_TAIL_DAEMON_JOBS:-}" ]; then
+    TAIL_DAEMON_JOBS="$CBM_TAIL_DAEMON_JOBS"
+else
+    case "$(uname -s 2>/dev/null)" in
+    MINGW* | MSYS*)
+        # Windows keeps the serial default: the isolated namespace lands in
+        # Python's temp directory, whose DACL shape the private-directory walk
+        # must accept — unproven on the runner images, and a refused runtime
+        # parent fails every suite in the wave. Opt in via CBM_TAIL_DAEMON_JOBS.
+        TAIL_DAEMON_JOBS=1
+        ;;
+    *)
+        if [ "$JOBS" -ge 8 ] 2>/dev/null; then
+            TAIL_DAEMON_JOBS=3
+        else
+            TAIL_DAEMON_JOBS=1
+        fi
+        ;;
+    esac
+fi
 # Wave suites spawn Cygwin-family tooling that can rewrite the build
 # directory's DACL behind the first stamp (observed: an arm shard whose
 # tail held the install-flow suites failed the source-directory policy
@@ -312,7 +370,12 @@ done < "$SER_FILE"
 # hosts those suites — always starts from the verified-clean shape.
 stamp_windows_build_dir pre-tail
 run_wave "$FLEX_FILE" "${CBM_TAIL_JOBS:-2}"
-run_wave "$EXCL_FILE" 1
+if [ "$TAIL_DAEMON_JOBS" -gt 1 ]; then
+    run_wave "$DAEMON_FILE" "$TAIL_DAEMON_JOBS" isolate
+else
+    run_wave "$DAEMON_FILE" 1
+fi
+run_wave "$EXTRACT_FILE" 1
 
 # ── Union guard: every suite in this shard's slice produced exactly one
 # result. The slice is deterministic, so N green shard jobs = full coverage;

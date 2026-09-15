@@ -198,6 +198,12 @@ static void free_import_map(const char **keys, const char **vals, int count) {
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
                                       const char **imp_keys, const char **imp_vals, int imp_count) {
+    /* A test file registers routes on a throwaway app to exercise handlers.
+     * Those are fixtures, not surface: counted, the biggest route declarer of
+     * a repo becomes a test module. */
+    if (source_node && source_node->file_path && cbm_is_test_path(source_node->file_path)) {
+        return;
+    }
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
@@ -216,20 +222,49 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
+    /* Every HANDLES edge carries the file that DECLARED the registration
+     * (source_node's file).  Fragment Route nodes are deduped by method+path
+     * alone, so handlers from unrelated files pile onto one shared node; the
+     * mount-composition pass uses decl_file to carry over only the handlers
+     * the mounted router file actually registered. */
+    char esc_df[CBM_SZ_512];
+    cbm_json_escape(esc_df, sizeof(esc_df), source_node->file_path ? source_node->file_path : "");
+    bool handled = false;
     if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
                                                      module_qn, imp_keys, imp_vals, imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler != NULL) {
-                char hprops[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
-                                           closing brace */
+                char hprops[CBM_SZ_2K]; /* must exceed escaped values + wrapper or snprintf cuts
+                                           the closing brace */
                 char esc_h[CBM_SZ_512];
                 cbm_json_escape(esc_h, sizeof(esc_h), hres.qualified_name);
-                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
+                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"decl_file\":\"%s\"}",
+                         esc_h, esc_df);
                 cbm_gbuf_insert_edge(ctx->gbuf, handler->id, route_id, "HANDLES", hprops);
+                handled = true;
             }
         }
+    }
+    /* Inline handler (`app.get('/x', async () => ...)`) — Fastify's dominant
+     * shape, and common in Express too.  There is no name to resolve, so the
+     * route would carry no HANDLES at all, and cross-repo matching
+     * (find_route_handler) refuses routes without one: an all-inline service
+     * silently produces zero matches.  The enclosing scope — the plugin
+     * function, or the file for a top-level registration — owns the handler's
+     * code and carries the name and file_path the cross-repo report needs.
+     * Mirrors the parallel path's emit_route_registration. */
+    if (!handled && cbm_pipeline_call_has_inline_handler(call) &&
+        cbm_pipeline_callee_is_router_shaped(call->callee_name)) {
+        char hprops[CBM_SZ_2K];
+        char esc_h[CBM_SZ_512];
+        cbm_json_escape(esc_h, sizeof(esc_h),
+                        source_node->qualified_name ? source_node->qualified_name : "");
+        snprintf(hprops, sizeof(hprops),
+                 "{\"handler\":\"%s\",\"source\":\"inline_handler\",\"decl_file\":\"%s\"}", esc_h,
+                 esc_df);
+        cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "HANDLES", hprops);
     }
 }
 
@@ -410,8 +445,31 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const char **imp_keys, const char **imp_vals, int imp_count,
                                  bool suppress_plain_calls) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
+    /* Also detect route registration by callee-name suffix when the resolved
+     * QN matches no service pattern.  A weak short-name match can bind
+     * `app.get` to the one project symbol named `get` (a memoizer method, a
+     * map wrapper), and a QN-only check then hides the verb suffix: the route
+     * disappears AND the #606 suppression drops the fabricated plain edge, so
+     * one unrelated `get` symbol silently erased every sequential-path route.
+     * The parallel resolver has carried this exact fallback since #523/#952
+     * (pass_parallel.c emit_service_edge) — this restores seq/parallel parity. */
+    if (svc == CBM_SVC_NONE && cbm_service_pattern_route_method(call->callee_name) != NULL) {
+        svc = CBM_SVC_ROUTE_REG;
+    }
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+        if (cbm_pipeline_is_route_registration(call, ctx->registry, ctx->gbuf, module_qn,
+                                               imp_keys, imp_vals, imp_count)) {
+            handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+            return;
+        }
+        /* A client call wearing a verb suffix: emit the HTTP edge cross-repo
+         * matching actually reads. */
+        cbm_resolution_t http_res = {.qualified_name = call->callee_name,
+                                     .confidence = PC_SVC_PATTERN_CONF,
+                                     .strategy = "verb_suffix_client",
+                                     .candidate_count = 0};
+        emit_http_async_edge(ctx, call, source, NULL, &http_res, CBM_SVC_HTTP,
+                             suppress_plain_calls);
         return;
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
@@ -465,6 +523,19 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 }
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
+/* Record a router mount before classification: the sequential dispatcher, like
+ * the parallel one, has no branch a mount would fall into. */
+static void calls_record_router_mount(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                      const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                      const char **imp_keys, const char **imp_vals,
+                                      int imp_count) {
+    if (!source_node || !cbm_pipeline_is_router_mount(call->callee_name)) {
+        return;
+    }
+    cbm_pipeline_emit_router_mount(ctx->gbuf, source_node, call, module_qn, ctx->registry,
+                                   ctx->gbuf, imp_keys, imp_vals, imp_count);
+}
+
 static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                const CBMResolvedCallArray *lsp_calls, const char *rel,
                                const char *module_qn, const char **imp_keys, const char **imp_vals,
@@ -473,6 +544,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!source_node) {
         return 0;
     }
+
+    calls_record_router_mount(ctx, call, source_node, module_qn, imp_keys, imp_vals, imp_count);
 
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
@@ -558,8 +631,17 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
          * sequential path minted zero Route nodes for such files. */
         if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
             call->first_string_arg[0] == '/') {
-            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
-                                      imp_count);
+            if (cbm_pipeline_is_route_registration(call, ctx->registry, ctx->gbuf, module_qn,
+                                                   imp_keys, imp_vals, imp_count)) {
+                handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                          imp_count);
+            } else {
+                cbm_resolution_t http_res = {.qualified_name = call->callee_name,
+                                             .confidence = PC_SVC_PATTERN_CONF,
+                                             .strategy = "verb_suffix_client",
+                                             .candidate_count = 0};
+                emit_http_async_edge(ctx, call, source_node, NULL, &http_res, CBM_SVC_HTTP, false);
+            }
             return SKIP_ONE;
         }
         cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);

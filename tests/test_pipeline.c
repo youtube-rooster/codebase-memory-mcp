@@ -4643,6 +4643,484 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     PASS();
 }
 
+/* True iff at least one HANDLES edge points at a Route node named route_name.
+ * Cross-repo matching (pass_cross_repo.c find_route_handler) refuses to emit a
+ * CROSS_HTTP_CALLS edge for a Route with no HANDLES, so this is the property
+ * that decides whether a whole service family is matchable at all. */
+static bool route_has_handles(cbm_store_t *s, const char *project, const char *route_name) {
+    cbm_node_t *routes = NULL;
+    int rc = 0;
+    cbm_store_find_nodes_by_name(s, project, route_name, &routes, &rc);
+    bool found = false;
+    for (int i = 0; i < rc && !found; i++) {
+        if (!routes[i].label || strcmp(routes[i].label, "Route") != 0) {
+            continue;
+        }
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_target_type(s, routes[i].id, "HANDLES", &edges, &ec);
+        found = ec > 0;
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (routes) {
+        cbm_store_free_nodes(routes, rc);
+    }
+    return found;
+}
+
+/* True iff a HANDLES edge points at a Route named route_name whose SOURCE node
+ * is named handler_name — i.e. the registration resolved the named handler and
+ * not merely something. */
+static bool route_handled_by(cbm_store_t *s, const char *project, const char *route_name,
+                             const char *handler_name) {
+    cbm_node_t *routes = NULL;
+    int rc = 0;
+    cbm_store_find_nodes_by_name(s, project, route_name, &routes, &rc);
+    bool found = false;
+    for (int i = 0; i < rc && !found; i++) {
+        if (!routes[i].label || strcmp(routes[i].label, "Route") != 0) {
+            continue;
+        }
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_target_type(s, routes[i].id, "HANDLES", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            cbm_node_t src = {0};
+            if (cbm_store_find_node_by_id(s, edges[j].source_id, &src) == CBM_STORE_OK) {
+                found = src.name && strcmp(src.name, handler_name) == 0;
+            }
+            cbm_node_free_fields(&src);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (routes) {
+        cbm_store_free_nodes(routes, rc);
+    }
+    return found;
+}
+
+/* Reproduce-first (Fastify HANDLES gap): a Fastify app registers virtually every
+ * route with an INLINE handler — `app.get('/health', async () => ...)` — so
+ * extract_handler_arg finds no identifier in handler position and no HANDLES
+ * edge is ever created. The Route node itself exists (the registration is
+ * classified correctly), but find_route_handler requires HANDLES, so an entire
+ * Fastify service produces zero cross-repo HTTP matches, reported as "0
+ * matches" rather than as an error. The handler for an inline registration is
+ * the enclosing function (or the file, for a top-level registration): that node
+ * carries the name and file_path cross-repo reporting needs. */
+TEST(pipeline_fastify_inline_handler_route_gets_handles) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fastify_inline_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/server.ts",
+                    "import Fastify from 'fastify';\n"
+                    "const app = Fastify();\n"
+                    "app.get('/health', async () => ({ status: 'ok' }));\n"
+                    "app.post('/publish/dynamic', async (req, reply) => {\n"
+                    "  return reply.send(1);\n"
+                    "});\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fastify_inline.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* The registrations themselves are recognised (router-shaped receiver
+     * `app` + inline handler) — Route nodes exist either way. */
+    ASSERT_GTE(count_nodes_named(s, project, "/health"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/publish/dynamic"), 1);
+    /* RED before the fix: no identifier in handler position → no HANDLES →
+     * invisible to cross-repo matching. */
+    ASSERT_TRUE(route_has_handles(s, project, "/health"));
+    ASSERT_TRUE(route_has_handles(s, project, "/publish/dynamic"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Reproduce-first (Fastify options object): Fastify moves the handler to arg 3
+ * when arg 2 is an options object — `app.get('/admin', { preHandler: guard },
+ * handler)`. The named-handler variant already works (extract_handler_arg scans
+ * past the object), so it is pinned here as the control; the inline variant in
+ * arg 3 is the broken one. */
+TEST(pipeline_fastify_options_object_handler_position) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fastify_opts_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/server.ts",
+                    "import Fastify from 'fastify';\n"
+                    "function guard(req: any) {}\n"
+                    "function metricsHandler(req: any): number {\n"
+                    "  return 1;\n"
+                    "}\n"
+                    "const app = Fastify();\n"
+                    "app.get('/admin', { preHandler: guard }, async (req) => 1);\n"
+                    "app.get('/me/metrics', { preHandler: guard }, metricsHandler);\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fastify_opts.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Control: named handler behind an options object resolves to the named
+     * function, never to the enclosing scope. */
+    ASSERT_TRUE(route_handled_by(s, project, "/me/metrics", "metricsHandler"));
+    /* RED before the fix: inline handler in arg 3 leaves the route unhandled. */
+    ASSERT_TRUE(route_has_handles(s, project, "/admin"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Reproduce-first (Fastify prefix mounting): Fastify composes paths with
+ * `app.register(plugin, { prefix: '/social' })` — a plugin function plus an
+ * options object, not Express's `app.use('/prefix', router)` shape. The mount
+ * detector only recognises `.use` with a leading path argument, so no MOUNTS
+ * edge exists, the fragment never gets its real path, and a caller asking for
+ * '/social/feed' can never meet the '/feed' the module declares. */
+TEST(pipeline_fastify_register_prefix_composes_mounts) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fastify_reg_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* server.ts first: write_temp_file only mkdirs ONE level, so src/ must
+     * exist before src/modules/ can. */
+    write_temp_file(tmp, "src/server.ts",
+                    "import Fastify from 'fastify';\n"
+                    "import socialModule from './modules/social';\n"
+                    "import adminModule from './modules/admin';\n"
+                    "const app = Fastify();\n"
+                    "await app.register(socialModule, { prefix: '/social' });\n"
+                    "await app.register(adminModule({ repo: 1 }), { prefix: '/admin' });\n");
+    /* Anonymous default-export plugin — the real module shape in the wild. */
+    write_temp_file(tmp, "src/modules/social.ts",
+                    "export default async function (app: any) {\n"
+                    "  app.get('/feed', async () => []);\n"
+                    "}\n");
+    /* Factory-call plugin: the plugin arriving as `adminModule({...})` must
+     * still resolve to the factory's file — the returned plugin's routes are
+     * declared there. */
+    write_temp_file(tmp, "src/modules/admin.ts",
+                    "export default function adminModule(deps: any) {\n"
+                    "  return async function (app: any) {\n"
+                    "    app.get('/users', async () => []);\n"
+                    "  };\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fastify_reg.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* RED before the fix: no MOUNTS edge for register(plugin, {prefix}) → the
+     * composed full-path Route never exists. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "MOUNTS"), 2);
+    ASSERT_GTE(count_nodes_named(s, project, "/social/feed"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/admin/users"), 1);
+    /* The composed route must carry the fragment's handler over, exactly as
+     * the Express composition does — HANDLES is what cross-repo reads. */
+    ASSERT_TRUE(route_has_handles(s, project, "/social/feed"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Reproduce-first (negative invariant, HTTP side): the inline-handler HANDLES
+ * fallback must fire only on registration-shaped evidence — a router-shaped
+ * receiver — never on "there is an inline callback" alone.  A memoizer wears
+ * the same shape (`cache.get('/users', async () => ...)`); it has always been
+ * misclassified as a route registration (pre-existing), but with no HANDLES it
+ * stayed excluded from cross-repo matching.  A HANDLES edge here promotes it
+ * into a fabricated CROSS_HTTP_CALLS answer for any client calling /users.
+ * The Fastify control in the same fixture pins the constraint from the other
+ * side: gating must not undo the inline-handler win on a real router receiver. */
+TEST(pipeline_client_shaped_inline_callback_gets_no_handles) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cache_get_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/server.ts",
+                    "import Fastify from 'fastify';\n"
+                    "import { createCache } from './cache';\n"
+                    "const app = Fastify();\n"
+                    "app.get('/health', async () => ({ ok: true }));\n"
+                    "const cache = createCache();\n"
+                    "cache.get('/users', async () => [1, 2]);\n");
+    write_temp_file(tmp, "src/cache.ts",
+                    "export function createCache(): any {\n"
+                    "  return { get: (k: string, fill: () => unknown) => fill() };\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cache_get.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Control: the router-shaped receiver keeps its inline HANDLES. */
+    ASSERT_TRUE(route_has_handles(s, project, "/health"));
+    /* RED before the fix: the memoizer's route (misclassification is
+     * pre-existing and tolerated) must NOT carry HANDLES — no HANDLES is what
+     * keeps find_route_handler from matching it cross-repo. */
+    ASSERT_FALSE(route_has_handles(s, project, "/users"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Reproduce-first (prefix decoy key): `prefixTrailingSlash` is a real Fastify
+ * option.  The prefix scan found "prefix" inside it, failed the ':' check, and
+ * abandoned the WHOLE argument instead of rescanning the rest of the string —
+ * so a register carrying both keys silently lost its mount and every composed
+ * path under it. */
+TEST(pipeline_fastify_register_prefix_survives_decoy_key) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fastify_decoy_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/server.ts",
+                    "import Fastify from 'fastify';\n"
+                    "import socialModule from './modules/social';\n"
+                    "const app = Fastify();\n"
+                    "await app.register(socialModule, "
+                    "{ prefixTrailingSlash: 'slash', prefix: '/social' });\n");
+    write_temp_file(tmp, "src/modules/social.ts",
+                    "export default async function (app: any) {\n"
+                    "  app.get('/feed', async () => []);\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fastify_decoy.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "MOUNTS"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/social/feed"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Count HANDLES edges into the Route named route_name, and how many of them
+ * come from a source node whose file_path ends with file_suffix. */
+static void route_handles_stats(cbm_store_t *s, const char *project, const char *route_name,
+                                const char *file_suffix, int *total, int *from_file) {
+    *total = 0;
+    *from_file = 0;
+    cbm_node_t *routes = NULL;
+    int rc = 0;
+    cbm_store_find_nodes_by_name(s, project, route_name, &routes, &rc);
+    for (int i = 0; i < rc; i++) {
+        if (!routes[i].label || strcmp(routes[i].label, "Route") != 0) {
+            continue;
+        }
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_target_type(s, routes[i].id, "HANDLES", &edges, &ec);
+        for (int j = 0; j < ec; j++) {
+            cbm_node_t src = {0};
+            if (cbm_store_find_node_by_id(s, edges[j].source_id, &src) == CBM_STORE_OK) {
+                (*total)++;
+                if (src.file_path) {
+                    size_t fl = strlen(src.file_path);
+                    size_t sl = strlen(file_suffix);
+                    if (fl >= sl && strcmp(src.file_path + fl - sl, file_suffix) == 0) {
+                        (*from_file)++;
+                    }
+                }
+            }
+            cbm_node_free_fields(&src);
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (routes) {
+        cbm_store_free_nodes(routes, rc);
+    }
+}
+
+/* Reproduce-first (mount-composition handler fan-out): fragment Route nodes are
+ * deduped by method+path alone, so every router file that registers
+ * `router.get('/', inline)` piles its HANDLES onto ONE shared `__route__GET__/`
+ * node.  mount_compose_one then copies the fragment's WHOLE pile onto each
+ * composed route: mounting aRoutes at '/a' gave '/a' the handlers of every
+ * OTHER router that also declares a root route.  On a real Express service that
+ * meant ~50 unrelated Module handlers per composed route, and
+ * find_route_handler's LIMIT 1 turned that into an arbitrary — confidently
+ * wrong — cross-repo answer.  The invariant: a composed route carries exactly
+ * the handlers registered in the router file the mount names, never a sibling's. */
+TEST(pipeline_mount_composition_keeps_handlers_per_router_file) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_mount_own_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/server.ts",
+                    "import express from 'express';\n"
+                    "import aRoutes from './aRoutes';\n"
+                    "import bRoutes from './bRoutes';\n"
+                    "const app = express();\n"
+                    "app.use('/a', aRoutes);\n"
+                    "app.use('/b', bRoutes);\n");
+    /* Both routers declare the SAME root fragment — the collision that makes
+     * the shared `__route__GET__/` node accumulate both handlers. */
+    write_temp_file(tmp, "src/aRoutes.ts",
+                    "import { Router } from 'express';\n"
+                    "const router = Router();\n"
+                    "router.get('/', async (req, res) => res.json(['a']));\n"
+                    "export default router;\n");
+    write_temp_file(tmp, "src/bRoutes.ts",
+                    "import { Router } from 'express';\n"
+                    "const router = Router();\n"
+                    "router.get('/', async (req, res) => res.json(['b']));\n"
+                    "export default router;\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/mount_own.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Both mounts composed. */
+    ASSERT_GTE(count_nodes_named(s, project, "/a"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/b"), 1);
+
+    /* RED before the fix: '/a' carries TWO handlers — its own plus bRoutes' —
+     * because the shared root fragment's pile is copied wholesale. */
+    int a_total = 0;
+    int a_own = 0;
+    int a_foreign = 0;
+    route_handles_stats(s, project, "/a", "aRoutes.ts", &a_total, &a_own);
+    route_handles_stats(s, project, "/a", "bRoutes.ts", &a_total, &a_foreign);
+    ASSERT_EQ(a_total, 1);
+    ASSERT_EQ(a_own, 1);
+    ASSERT_EQ(a_foreign, 0);
+
+    int b_total = 0;
+    int b_own = 0;
+    int b_foreign = 0;
+    route_handles_stats(s, project, "/b", "bRoutes.ts", &b_total, &b_own);
+    route_handles_stats(s, project, "/b", "aRoutes.ts", &b_total, &b_foreign);
+    ASSERT_EQ(b_total, 1);
+    ASSERT_EQ(b_own, 1);
+    ASSERT_EQ(b_foreign, 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Same inline-handler property on the PARALLEL resolver (>= 50 files forces
+ * pass_parallel.c's resolve_file_calls, which is the path every real repo
+ * takes). Sequential and parallel emit registrations from two separate
+ * functions (handle_route_registration / emit_route_registration), so a fix in
+ * one does not prove the other. */
+TEST(pipeline_fastify_inline_handler_handles_parallel) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fastify_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/server.ts",
+                    "import Fastify from 'fastify';\n"
+                    "const app = Fastify();\n"
+                    "app.get('/health', async () => ({ status: 'ok' }));\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number {\n  return %d;\n}\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1); /* force parallel regardless of host cores */
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/fastify_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(count_nodes_named(s, project, "/health"), 1);
+    ASSERT_TRUE(route_has_handles(s, project, "/health"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Reproduce-first: pass_parallel's fused cross-LSP eligibility currently counts
  * only parser-backed calls/call references. A Python binary operator has no
  * parser CBMCall; its __add__ semantic record and carrier are created together
@@ -11991,6 +12469,13 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_fastify_inline_handler_route_gets_handles);
+    RUN_TEST(pipeline_fastify_options_object_handler_position);
+    RUN_TEST(pipeline_fastify_register_prefix_composes_mounts);
+    RUN_TEST(pipeline_mount_composition_keeps_handlers_per_router_file);
+    RUN_TEST(pipeline_client_shaped_inline_callback_gets_no_handles);
+    RUN_TEST(pipeline_fastify_register_prefix_survives_decoy_key);
+    RUN_TEST(pipeline_fastify_inline_handler_handles_parallel);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);

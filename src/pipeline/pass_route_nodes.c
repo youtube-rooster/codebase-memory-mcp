@@ -439,6 +439,14 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         return 0;
     }
 
+    /* A route decorated inside a test file is a fixture standing in for the
+     * service, not a surface the service exposes.  Counted, it makes the
+     * biggest route declarer of a repo a test module. */
+    if (strstr(func->properties_json, "\"is_test\":true") ||
+        (func->file_path && cbm_is_test_path(func->file_path))) {
+        return 0;
+    }
+
     char path[CBM_SZ_256];
     if (!extract_json_prop(func->properties_json, "route_path", path, sizeof(path))) {
         return 0;
@@ -472,9 +480,13 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
         }
     }
 
+    /* Same property the call-registration path writes: without it the route
+     * belongs to the repo and not to the file, and every module sharing a
+     * directory inherits every route the directory declares. */
     char hprops[CBM_SZ_512];
-    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}",
-             func->qualified_name ? func->qualified_name : "");
+    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}",
+             func->qualified_name ? func->qualified_name : "",
+             func->file_path ? func->file_path : "");
     cbm_gbuf_insert_edge(gb, func->id, route_id, "HANDLES", hprops);
     return SKIP_ONE;
 }
@@ -584,6 +596,252 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
         char buf[CBM_SZ_16];
         snprintf(buf, sizeof(buf), "%d", connected);
         cbm_log_info("pass.prefix_bridge", "connected", buf);
+    }
+}
+
+/* ── Express router mounts ────────────────────────────────────────
+ *
+ * A router file declares fragments ("/accounts"); the mount supplies the rest
+ * ("/org").  Only here are both in one graph, so this is where the real path
+ * gets built.  The fragment node stays — the buffer has no single-node delete —
+ * but it keeps its own QN, so a caller asking for the full path reaches the
+ * composed node and only that one.
+ *
+ * The composed node also carries the router's file path, which the fragment
+ * never had: route nodes are minted with an empty file, so until now no route
+ * could be traced back to the file that declared it. */
+
+/* Join a mount prefix and a route fragment into one path, collapsing the seam. */
+static void mount_join_path(const char *prefix, const char *fragment, char *out, size_t out_sz) {
+    size_t oi = 0;
+    for (const char *p = prefix; *p && oi < out_sz - SKIP_ONE; p++) {
+        out[oi++] = *p;
+    }
+    while (oi > 0 && out[oi - SKIP_ONE] == '/') {
+        oi--;
+    }
+    const char *f = fragment;
+    if (*f != '/' && oi < out_sz - SKIP_ONE) {
+        out[oi++] = '/';
+    }
+    /* A router's root route is written "/" and contributes no segment. */
+    if (strcmp(fragment, "/") == 0) {
+        f = "";
+    }
+    while (*f && oi < out_sz - SKIP_ONE) {
+        out[oi++] = *f++;
+    }
+    if (oi == 0 && oi < out_sz - SKIP_ONE) {
+        out[oi++] = '/';
+    }
+    out[oi] = '\0';
+}
+
+/* Build the composed Route for one fragment and carry its handlers over.
+ *
+ * Handler ids are copied out before the first insert: inserting an edge can
+ * grow the buffer's edge array, which invalidates every pointer a previous
+ * lookup handed back. */
+static int mount_compose_one(cbm_gbuf_t *gb, int64_t registrar_id, int64_t fragment_id,
+                             const char *prefix, const char *router_file) {
+    const cbm_gbuf_node_t *fragment = cbm_gbuf_find_by_id(gb, fragment_id);
+    if (!fragment || !fragment->name || fragment->name[0] != '/') {
+        return 0;
+    }
+    char method[CBM_SZ_16] = "ANY";
+    if (fragment->properties_json) {
+        extract_json_prop(fragment->properties_json, "method", method, sizeof(method));
+    }
+
+    char full[CBM_SZ_512];
+    mount_join_path(prefix, fragment->name, full, sizeof(full));
+
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    char cpath[CBM_SZ_256];
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method,
+             cbm_route_canon_path(full, cpath, sizeof(cpath)));
+    if (fragment->qualified_name && strcmp(route_qn, fragment->qualified_name) == 0) {
+        return 0; /* the mount added nothing */
+    }
+
+    /* Snapshot the handlers while no insert has happened yet.
+     *
+     * Fragments are shared: the node is keyed by method+path alone, so every
+     * router file that registers `router.get('/', ...)` piles its HANDLES onto
+     * the SAME `__route__GET__/` node.  Carrying that whole pile onto the
+     * composed route hands `/lives` the handlers of every unrelated router that
+     * also declares a root route — and find_route_handler's LIMIT 1 then
+     * reports one of them, arbitrarily, as THE handler.  Each HANDLES edge
+     * records the file that declared its registration (decl_file); only the
+     * handlers the mounted router file registered cross over.  Edges without a
+     * decl_file (decorator-pass HANDLES) keep the old carry-everything
+     * behaviour — their emitters have no declaring-file notion yet. */
+    const cbm_gbuf_edge_t **handles = NULL;
+    int hcount = 0;
+    cbm_gbuf_find_edges_by_target_type(gb, fragment_id, "HANDLES", &handles, &hcount);
+    int64_t *handler_ids = NULL;
+    int handler_count = 0;
+    if (hcount > 0) {
+        handler_ids = (int64_t *)calloc((size_t)hcount, sizeof(int64_t));
+        if (handler_ids) {
+            for (int i = 0; i < hcount; i++) {
+                char decl_file[CBM_SZ_512];
+                if (handles[i]->properties_json &&
+                    extract_json_prop(handles[i]->properties_json, "decl_file", decl_file,
+                                      sizeof(decl_file)) &&
+                    decl_file[0] && strcmp(decl_file, router_file) != 0) {
+                    continue;
+                }
+                handler_ids[handler_count++] = handles[i]->source_id;
+            }
+        }
+    }
+
+    char rprops[CBM_SZ_256];
+    snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"router_mount\"}", method);
+    int64_t full_id = cbm_gbuf_upsert_node(gb, "Route", full, route_qn, router_file, 0, 0, rprops);
+    if (full_id <= 0) {
+        free(handler_ids);
+        return 0;
+    }
+
+    /* Cross-repo matching finds the callee side through HANDLES, so the handler
+     * has to reach the composed node and not only the fragment. */
+    for (int i = 0; i < handler_count; i++) {
+        const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_id(gb, handler_ids[i]);
+        if (!handler) {
+            continue;
+        }
+        char esc_h[CBM_SZ_512];
+        cbm_json_escape(esc_h, sizeof(esc_h),
+                        handler->qualified_name ? handler->qualified_name : "");
+        char esc_df[CBM_SZ_512];
+        cbm_json_escape(esc_df, sizeof(esc_df), router_file ? router_file : "");
+        char hprops[CBM_SZ_2K];
+        snprintf(hprops, sizeof(hprops),
+                 "{\"handler\":\"%s\",\"source\":\"router_mount\",\"decl_file\":\"%s\"}", esc_h,
+                 esc_df);
+        cbm_gbuf_insert_edge(gb, handler_ids[i], full_id, "HANDLES", hprops);
+    }
+    free(handler_ids);
+
+    char esc_full[CBM_SZ_256];
+    cbm_json_escape(esc_full, sizeof(esc_full), full);
+    char cprops[CBM_SZ_512];
+    snprintf(cprops, sizeof(cprops), "{\"url_path\":\"%s\",\"via\":\"router_mount\"}", esc_full);
+    cbm_gbuf_insert_edge(gb, registrar_id, full_id, "CALLS", cprops);
+    return SKIP_ONE;
+}
+
+/* One mount, flattened out of the graph so it survives later inserts. */
+typedef struct {
+    int64_t registrar_id;
+    char prefix[CBM_SZ_256];
+    char router_file[CBM_SZ_512];
+} mount_rec_t;
+
+/* One route registration, likewise flattened. */
+typedef struct {
+    int64_t fragment_id;
+    char decl_file[CBM_SZ_512];
+} reg_rec_t;
+
+/* Copy every MOUNTS edge out of the graph. Returns the count, 0 on failure. */
+static int collect_mounts(cbm_gbuf_t *gb, mount_rec_t **out) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_type(gb, "MOUNTS", &edges, &count) != 0 || count <= 0) {
+        return 0;
+    }
+    mount_rec_t *recs = (mount_rec_t *)calloc((size_t)count, sizeof(mount_rec_t));
+    if (!recs) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        char prefix[CBM_SZ_256];
+        if (!extract_json_prop(edges[i]->properties_json, "prefix", prefix, sizeof(prefix))) {
+            continue;
+        }
+        const cbm_gbuf_node_t *router = cbm_gbuf_find_by_id(gb, edges[i]->target_id);
+        if (!router || !router->file_path || !router->file_path[0]) {
+            continue;
+        }
+        recs[n].registrar_id = edges[i]->source_id;
+        snprintf(recs[n].prefix, sizeof(recs[n].prefix), "%s", prefix);
+        snprintf(recs[n].router_file, sizeof(recs[n].router_file), "%s", router->file_path);
+        n++;
+    }
+    *out = recs;
+    return n;
+}
+
+/* Copy every route-registration CALLS edge out of the graph. */
+static int collect_registrations(cbm_gbuf_t *gb, reg_rec_t **out) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_type(gb, "CALLS", &edges, &count) != 0 || count <= 0) {
+        return 0;
+    }
+    reg_rec_t *recs = (reg_rec_t *)calloc((size_t)count, sizeof(reg_rec_t));
+    if (!recs) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        if (!edges[i]->properties_json ||
+            !strstr(edges[i]->properties_json, "\"via\":\"route_registration\"")) {
+            continue;
+        }
+        const cbm_gbuf_node_t *decl = cbm_gbuf_find_by_id(gb, edges[i]->source_id);
+        if (!decl || !decl->file_path || !decl->file_path[0]) {
+            continue;
+        }
+        const cbm_gbuf_node_t *fragment = cbm_gbuf_find_by_id(gb, edges[i]->target_id);
+        if (!fragment || !fragment->label || strcmp(fragment->label, "Route") != 0) {
+            continue;
+        }
+        recs[n].fragment_id = edges[i]->target_id;
+        snprintf(recs[n].decl_file, sizeof(recs[n].decl_file), "%s", decl->file_path);
+        n++;
+    }
+    *out = recs;
+    return n;
+}
+
+/* Phase 2c: turn every MOUNTS edge into full-path Route nodes. */
+static void apply_router_mounts(cbm_gbuf_t *gb) {
+    mount_rec_t *mounts = NULL;
+    int mount_count = collect_mounts(gb, &mounts);
+    if (mount_count == 0) {
+        free(mounts);
+        return;
+    }
+    reg_rec_t *regs = NULL;
+    int reg_count = collect_registrations(gb, &regs);
+    if (reg_count == 0) {
+        free(mounts);
+        free(regs);
+        return;
+    }
+
+    int composed = 0;
+    for (int mi = 0; mi < mount_count; mi++) {
+        for (int ri = 0; ri < reg_count; ri++) {
+            if (strcmp(regs[ri].decl_file, mounts[mi].router_file) != 0) {
+                continue;
+            }
+            composed += mount_compose_one(gb, mounts[mi].registrar_id, regs[ri].fragment_id,
+                                          mounts[mi].prefix, mounts[mi].router_file);
+        }
+    }
+    free(mounts);
+    free(regs);
+
+    if (composed > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", composed);
+        cbm_log_info("pass.router_mounts", "composed", buf);
     }
 }
 
@@ -1207,6 +1465,9 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     /* Phase 2a: ensure all functions with route_path have Route+HANDLES.
      * Handles incremental mode where unchanged files don't re-extract. */
     ensure_decorator_routes(gb);
+    /* Runs after fragments and handlers exist, before data flows are built so
+     * the composed routes participate in them. */
+    apply_router_mounts(gb);
 
     /* Phase 2b: connect prefix Routes to decorator handler Functions.
      * Must run BEFORE match_infra_routes so infra matching can find

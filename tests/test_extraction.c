@@ -5314,6 +5314,245 @@ TEST(iris_export_xml_multi_class) {
     PASS();
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * In-house bus port channels (message_type namespace)
+ *
+ * The RChat bus (TS `src/lib/bus/ports.ts` mirrored by Python
+ * `shared/bus/ports.py`) routes every event through one SNS→SQS pipe; the
+ * channel identity is the envelope's `event` field, not a queue name.  The
+ * producer side is `publisher.publish('event_name', body)` and the consumer
+ * side dispatches on `msg.event`.  Both must land on the SAME transport
+ * namespace ("message_type") or the cross-repo matcher can never pair them.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Find a channel by name+transport+direction. */
+static int has_channel(CBMFileResult *r, const char *name, const char *transport, int direction) {
+    for (int i = 0; i < r->channels.count; i++) {
+        CBMChannel *ch = &r->channels.items[i];
+        if (ch->channel_name && strcmp(ch->channel_name, name) == 0 && ch->transport &&
+            strcmp(ch->transport, transport) == 0 && (int)ch->direction == direction)
+            return 1;
+    }
+    return 0;
+}
+
+TEST(channel_js_bus_publisher_publish_is_message_type_emit) {
+    /* rchat-api gamification: `deps.publisher.publish('coins_changed', {...})`.
+     * The first argument IS the message-type discriminator — same namespace a
+     * consumer switch on `msg.event` lands in. */
+    CBMFileResult *r = extract("async function grantCoins(deps, userId) {\n"
+                               "  await deps.publisher.publish('coins_changed', { user_id: "
+                               "userId })\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "consumer.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "coins_changed", "message_type", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_bus_receiver_publish_is_message_type_emit) {
+    /* A receiver literally named `bus` classifies as event_emitter for
+     * emit/on, but `.publish` is the in-house port verb — the event name goes
+     * to the message_type namespace, not event_emitter. */
+    CBMFileResult *r = extract("async function fire(bus) {\n"
+                               "  await bus.publish('badge_awarded', { id: 1 })\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "award.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "badge_awarded", "message_type", CBM_CHANNEL_EMIT));
+    ASSERT_FALSE(has_channel(r, "badge_awarded", "event_emitter", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_unrelated_publish_receiver_is_not_a_channel) {
+    /* `repo.publish({...})` (rchat-api content module) is a repository method,
+     * not a bus port: no literal event name, receiver is not port-shaped. */
+    CBMFileResult *r = extract("async function publishContent(repo, draft) {\n"
+                               "  await repo.publish({ title: draft.title })\n"
+                               "  await service.publish('not_a_bus_event')\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "publish.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->channels.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * AWS SDK v3 command channels (SQS / SNS / EventBridge)
+ *
+ * v3 does not name the operation on the client: every call is
+ * `client.send(new XxxCommand({...}))`.  The receiver is an opaque handle
+ * (`this.client`) whose tail reads as "client" — which classifies as
+ * socketio — and the first argument is a `new_expression`, not a string, so
+ * `extract_channel_name` returned NULL and the call was dropped without a
+ * trace.  The command CLASS is what pins transport and direction, exactly as
+ * `sendToQueue` pins amqplib.  The queue is named by the `QueueUrl` /
+ * `TopicArn` property of the command payload.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(channel_js_aws_v3_send_message_command_is_sqs_emit) {
+    CBMFileResult *r = extract("async function push(client, body) {\n"
+                               "  await client.send(new SendMessageCommand({ QueueUrl: "
+                               "'https://sqs.us-east-1.amazonaws.com/1/comments', MessageBody: "
+                               "body }))\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "push.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "https://sqs.us-east-1.amazonaws.com/1/comments", "sqs",
+                       CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_aws_v3_receive_message_command_is_sqs_listen) {
+    /* The consumer side.  Without it the queue has publishers and no listener,
+     * which is indistinguishable from a queue nobody reads. */
+    CBMFileResult *r = extract("async function poll(client) {\n"
+                               "  const { Messages } = await client.send(new "
+                               "ReceiveMessageCommand({ QueueUrl: 'ingest-queue', "
+                               "WaitTimeSeconds: 20 }))\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "poll.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "ingest-queue", "sqs", CBM_CHANNEL_LISTEN));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_aws_v3_publish_command_is_sns_emit) {
+    CBMFileResult *r = extract("async function fire(client) {\n"
+                               "  await client.send(new PublishCommand({ TopicArn: "
+                               "'arn:aws:sns:us-east-1:1:events', Message: '{}' }))\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "fire.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "arn:aws:sns:us-east-1:1:events", "sns", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_aws_v3_queue_url_from_env_is_named_by_env_key) {
+    /* The queue URL is configuration, so the literal is almost never at the
+     * call site.  Naming the channel after the env key is what lets a producer
+     * in one repo meet a consumer in another: both read the same key, and the
+     * key is stable where the resolved URL is not. */
+    CBMFileResult *r = extract("async function push(client, body) {\n"
+                               "  await client.send(new SendMessageCommand({ QueueUrl: "
+                               "env.BUS_NEW_COMMENT_QUEUE_URL, MessageBody: body }))\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "push.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "BUS_NEW_COMMENT_QUEUE_URL", "sqs", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_aws_v3_field_defaulted_from_env_is_named_by_env_key) {
+    /* The real rchat-api shape (`src/lib/bus/aws-adapter.ts`): the topic is a
+     * constructor parameter property whose default is the env read, and the
+     * call site only ever sees `this.topicArn`. */
+    CBMFileResult *r = extract("class SnsPublisher {\n"
+                               "  constructor(private readonly topicArn: string | undefined = "
+                               "env.BUS_EVENTS_TOPIC_ARN, private readonly client = new "
+                               "SNSClient({})) {}\n"
+                               "  async publishIt(body: string) {\n"
+                               "    await this.client.send(new PublishCommand({ TopicArn: "
+                               "this.topicArn, Message: body }))\n"
+                               "  }\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "aws-adapter.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "BUS_EVENTS_TOPIC_ARN", "sns", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_js_aws_v3_non_messaging_command_is_not_a_channel) {
+    /* S3 and DynamoDB ride the same `client.send(new XxxCommand(...))` shape.
+     * They are storage, not topology: naming them channels would invent edges
+     * between every repo that reads the same bucket. */
+    CBMFileResult *r = extract("async function load(client) {\n"
+                               "  await client.send(new GetObjectCommand({ Bucket: 'assets', "
+                               "Key: 'a.png' }))\n"
+                               "  await client.send(new PutItemCommand({ TableName: 'users' }))\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "load.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->channels.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_py_bus_publish_normalized_to_message_type) {
+    /* rchat-workers `publish.py`: `await bus.publish("mini_trendings", body)`.
+     * Historically labelled transport "bus", which split the QN namespace from
+     * the JS side's "message_type" for the SAME logical event pipe. */
+    CBMFileResult *r = extract("async def emit_insight(bus, body):\n"
+                               "    await bus.publish(\"mini_trendings\", body)\n",
+                               CBM_LANG_PYTHON, "t", "publish.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "mini_trendings", "message_type", CBM_CHANNEL_EMIT));
+    ASSERT_FALSE(has_channel(r, "mini_trendings", "bus", CBM_CHANNEL_EMIT));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_py_event_comparison_is_message_type_listen) {
+    /* rchat-workers handlers dispatch with `if msg.event != "new_comment":
+     * return` — the Python mirror of the JS `switch (msg.event)` consumer.
+     * Both the != guard and the == dispatch shape name the handled event. */
+    CBMFileResult *r = extract("async def handle(msg):\n"
+                               "    if msg.event != \"new_comment\":\n"
+                               "        return\n"
+                               "    await process(msg)\n"
+                               "\n"
+                               "async def ingest(msg):\n"
+                               "    if msg.event == \"comment_moderated\":\n"
+                               "        await moderate(msg)\n",
+                               CBM_LANG_PYTHON, "t", "handler.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_channel(r, "new_comment", "message_type", CBM_CHANNEL_LISTEN));
+    ASSERT(has_channel(r, "comment_moderated", "message_type", CBM_CHANNEL_LISTEN));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(channel_py_non_event_comparison_is_not_a_channel) {
+    /* Negative invariant: `.type` comparisons are everywhere in non-broker
+     * Python (AST tooling, enums) — only event-ish fields qualify, and a bare
+     * identifier comparison names nothing.  None of these may fabricate a
+     * channel. */
+    CBMFileResult *r = extract("def walk(node, color):\n"
+                               "    if node.type == \"assignment\":\n"
+                               "        return 1\n"
+                               "    if color == \"red\":\n"
+                               "        return 2\n"
+                               "    if node.kind == \"call\":\n"
+                               "        return 3\n"
+                               "    if node.event == 3:\n"
+                               "        return 4\n",
+                               CBM_LANG_PYTHON, "t", "walk.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->channels.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -5637,6 +5876,18 @@ SUITE(extraction) {
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
+    RUN_TEST(channel_js_bus_publisher_publish_is_message_type_emit);
+    RUN_TEST(channel_js_bus_receiver_publish_is_message_type_emit);
+    RUN_TEST(channel_js_unrelated_publish_receiver_is_not_a_channel);
+    RUN_TEST(channel_js_aws_v3_send_message_command_is_sqs_emit);
+    RUN_TEST(channel_js_aws_v3_receive_message_command_is_sqs_listen);
+    RUN_TEST(channel_js_aws_v3_publish_command_is_sns_emit);
+    RUN_TEST(channel_js_aws_v3_queue_url_from_env_is_named_by_env_key);
+    RUN_TEST(channel_js_aws_v3_field_defaulted_from_env_is_named_by_env_key);
+    RUN_TEST(channel_js_aws_v3_non_messaging_command_is_not_a_channel);
+    RUN_TEST(channel_py_bus_publish_normalized_to_message_type);
+    RUN_TEST(channel_py_event_comparison_is_message_type_listen);
+    RUN_TEST(channel_py_non_event_comparison_is_not_a_channel);
 
     cbm_shutdown();
 }

@@ -149,84 +149,6 @@ static bool cross_repo_seed_http_pair_files(const cross_repo_fixture_t *fixture,
     return ok;
 }
 
-static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
-                                      const char *source_project, const char *target_project,
-                                      const char *route_path, const char *suffix) {
-    return cross_repo_seed_http_pair_files(fixture, source_project, target_project, route_path,
-                                           suffix, "client.c", "server.c");
-}
-
-/* Seed one EMITS/LISTENS_ON pair on the same channel name across two stores. */
-static bool cross_repo_seed_channel_pair_files(const cross_repo_fixture_t *fixture,
-                                               const char *source_project,
-                                               const char *target_project,
-                                               const char *channel_name, const char *emitter_file,
-                                               const char *listener_file) {
-    char source_path[512];
-    char target_path[512];
-    if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path)) ||
-        !cross_repo_project_path(fixture, target_project, target_path, sizeof(target_path))) {
-        return false;
-    }
-    cbm_store_t *source = cbm_store_open_path(source_path);
-    cbm_store_t *target = cbm_store_open_path(target_path);
-    if (!source || !target) {
-        cbm_store_close(source);
-        cbm_store_close(target);
-        return false;
-    }
-
-    bool ok = cbm_store_upsert_project(source, source_project, fixture->cache) == CBM_STORE_OK &&
-              cbm_store_upsert_project(target, target_project, fixture->cache) == CBM_STORE_OK;
-
-    char emitter_qn[256];
-    char listener_qn[256];
-    char channel_qn[256];
-    snprintf(emitter_qn, sizeof(emitter_qn), "%s.emit", source_project);
-    snprintf(listener_qn, sizeof(listener_qn), "%s.listen", target_project);
-    snprintf(channel_qn, sizeof(channel_qn), "__channel__%s", channel_name);
-
-    cbm_node_t emitter = {.project = source_project,
-                          .label = "Function",
-                          .name = "emit_event",
-                          .qualified_name = emitter_qn,
-                          .file_path = emitter_file};
-    cbm_node_t src_channel = {.project = source_project,
-                              .label = "Channel",
-                              .name = channel_name,
-                              .qualified_name = channel_qn,
-                              .file_path = emitter_file};
-    int64_t emitter_id = ok ? cbm_store_upsert_node(source, &emitter) : 0;
-    int64_t src_channel_id = ok ? cbm_store_upsert_node(source, &src_channel) : 0;
-    cbm_edge_t emits = {.project = source_project,
-                        .source_id = emitter_id,
-                        .target_id = src_channel_id,
-                        .type = "EMITS"};
-    ok = ok && emitter_id > 0 && src_channel_id > 0 && cbm_store_insert_edge(source, &emits) > 0;
-
-    cbm_node_t listener = {.project = target_project,
-                           .label = "Function",
-                           .name = "on_event",
-                           .qualified_name = listener_qn,
-                           .file_path = listener_file};
-    cbm_node_t tgt_channel = {.project = target_project,
-                              .label = "Channel",
-                              .name = channel_name,
-                              .qualified_name = channel_qn,
-                              .file_path = listener_file};
-    int64_t listener_id = ok ? cbm_store_upsert_node(target, &listener) : 0;
-    int64_t tgt_channel_id = ok ? cbm_store_upsert_node(target, &tgt_channel) : 0;
-    cbm_edge_t listens = {.project = target_project,
-                          .source_id = listener_id,
-                          .target_id = tgt_channel_id,
-                          .type = "LISTENS_ON"};
-    ok = ok && listener_id > 0 && tgt_channel_id > 0 && cbm_store_insert_edge(target, &listens) > 0;
-
-    cbm_store_close(source);
-    cbm_store_close(target);
-    return ok;
-}
-
 static bool cross_repo_exec(const cross_repo_fixture_t *fixture, const char *project,
                             const char *sql) {
     char path[512];
@@ -257,6 +179,13 @@ static int cross_repo_count_edges(const cross_repo_fixture_t *fixture, const cha
     int count = cbm_store_count_edges_by_type(store, project, edge_type);
     cbm_store_close(store);
     return count;
+}
+
+static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
+                                      const char *source_project, const char *target_project,
+                                      const char *route_path, const char *suffix) {
+    return cross_repo_seed_http_pair_files(fixture, source_project, target_project, route_path,
+                                           suffix, "client.c", "server.c");
 }
 
 TEST(cross_repo_null_target_fails_without_dereference) {
@@ -599,12 +528,117 @@ TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609) {
     PASS();
 }
 
-/* A test fixture is not a caller. cbm's own suite seeds sample routes
- * ("/admin/users", "/publish/dynamic") and temp paths ("/tmp/test") as string
- * literals to exercise the extractors; the matcher read those literals as real
- * HTTP calls and wired them to whatever repo happened to serve a route of the
- * same name. Measured on this workspace: 141 of 145 cross edges out of the cbm
- * project came from tests/, 135 of them from the single literal "/tmp/test". */
+/* ── Channel transport invariants ────────────────────────────────
+ *
+ * A Channel's identity is (name, transport): `message` on Socket.IO and
+ * `message` on RabbitMQ are unrelated conversations that happen to share a
+ * word.  The matcher must pair an emitter only with a listener on the SAME
+ * transport — otherwise every generic event name (`message`, `error`,
+ * `update`) fabricates cross-repo edges between services that never talk. */
+
+static bool cross_repo_seed_channel_side(const cross_repo_fixture_t *fixture, const char *project,
+                                         const char *channel_name, const char *transport,
+                                         const char *edge_type, const char *fn_file) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store) {
+        return false;
+    }
+    bool ok = cbm_store_upsert_project(store, project, fixture->cache) == CBM_STORE_OK;
+
+    char fn_qn[256];
+    char channel_qn[256];
+    char channel_props[256];
+    char edge_props[128];
+    snprintf(fn_qn, sizeof(fn_qn), "%s.%s.%s", project, edge_type, channel_name);
+    snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s", transport, channel_name);
+    snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\",\"name\":\"%s\"}",
+             transport, channel_name);
+    snprintf(edge_props, sizeof(edge_props), "{\"transport\":\"%s\"}", transport);
+
+    cbm_node_t fn = {.project = project,
+                     .label = "Function",
+                     .name = "participant",
+                     .qualified_name = fn_qn,
+                     .file_path = fn_file};
+    cbm_node_t channel = {.project = project,
+                          .label = "Channel",
+                          .name = channel_name,
+                          .qualified_name = channel_qn,
+                          .properties_json = channel_props};
+    int64_t fn_id = ok ? cbm_store_upsert_node(store, &fn) : 0;
+    int64_t channel_id = ok ? cbm_store_upsert_node(store, &channel) : 0;
+    cbm_edge_t edge = {.project = project,
+                       .source_id = fn_id,
+                       .target_id = channel_id,
+                       .type = edge_type,
+                       .properties_json = edge_props};
+    ok = ok && fn_id > 0 && channel_id > 0 && cbm_store_insert_edge(store, &edge) > 0;
+    cbm_store_close(store);
+    return ok;
+}
+
+TEST(cross_channel_same_name_and_transport_links) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_channel_side(&fixture, "chan-source", "new_comment",
+                                              "message_type", "EMITS", "publish.py") &&
+                 cross_repo_seed_channel_side(&fixture, "chan-target", "new_comment",
+                                              "message_type", "LISTENS_ON", "consumer.ts");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed matching channel fixture");
+    }
+
+    const char *target = "chan-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("chan-source", &target, 1);
+    int src_edges = cross_repo_count_edges(&fixture, "chan-source", "CROSS_CHANNEL");
+    int tgt_edges = cross_repo_count_edges(&fixture, "chan-target", "CROSS_CHANNEL");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 1);
+    ASSERT_EQ(src_edges, 1); /* forward: emitter → local Channel */
+    ASSERT_EQ(tgt_edges, 1); /* reverse: listener → target Channel */
+    PASS();
+}
+
+TEST(cross_channel_same_name_different_transport_does_not_link) {
+    /* The negative invariant: a Socket.IO `message` emitter and a RabbitMQ
+     * `message` consumer share nothing but a word.  Zero edges, both sides. */
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_channel_side(&fixture, "mismatch-source", "message", "socketio",
+                                              "EMITS", "socket.ts") &&
+                 cross_repo_seed_channel_side(&fixture, "mismatch-target", "message", "rabbitmq",
+                                              "LISTENS_ON", "consumer.ts");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed mismatched channel fixture");
+    }
+
+    const char *target = "mismatch-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("mismatch-source", &target, 1);
+    int src_edges = cross_repo_count_edges(&fixture, "mismatch-source", "CROSS_CHANNEL");
+    int tgt_edges = cross_repo_count_edges(&fixture, "mismatch-target", "CROSS_CHANNEL");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 0);
+    ASSERT_EQ(src_edges, 0);
+    ASSERT_EQ(tgt_edges, 0);
+    PASS();
+}
+
+/* A test fixture is not a caller. A suite seeds sample routes ("/admin/users")
+ * and temp paths ("/tmp/test") as string literals to exercise the extractors;
+ * the matcher read those literals as real traffic and wired them to whatever
+ * project happened to serve a route of the same name. Measured on a 23-repo
+ * workspace: 141 of the 145 cross edges leaving cbm's own project came from
+ * tests/, 135 of them from the single literal "/tmp/test". */
 TEST(cross_repo_ignores_http_call_declared_in_a_test_file) {
     cross_repo_fixture_t fixture;
     bool setup = cross_repo_fixture_begin(&fixture) &&
@@ -653,12 +687,13 @@ TEST(cross_repo_ignores_route_declared_in_a_test_file) {
 
 /* The same fixture problem on the broker side: a suite that publishes to a
  * queue name to exercise its own adapter is not a producer of that queue. */
-TEST(cross_repo_ignores_channel_emitted_from_a_test_file) {
+TEST(cross_channel_ignores_emitter_in_a_test_file) {
     cross_repo_fixture_t fixture;
     bool setup = cross_repo_fixture_begin(&fixture) &&
-                 cross_repo_seed_channel_pair_files(&fixture, "chan-test-source", "chan-test-target",
-                                                    "comments.moderation.queue",
-                                                    "tests/test_worker.py", "src/consumer.ts");
+                 cross_repo_seed_channel_side(&fixture, "chan-test-source", "new_comment",
+                                              "message_type", "EMITS", "tests/test_worker.py") &&
+                 cross_repo_seed_channel_side(&fixture, "chan-test-target", "new_comment",
+                                              "message_type", "LISTENS_ON", "consumer.ts");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed test-file emitter fixture");
@@ -666,42 +701,47 @@ TEST(cross_repo_ignores_channel_emitted_from_a_test_file) {
 
     const char *target = "chan-test-target";
     cbm_cross_repo_result_t result = cbm_cross_repo_match("chan-test-source", &target, 1);
-    int emitted = cross_repo_count_edges(&fixture, "chan-test-source", "CROSS_CHANNEL");
+    int src_edges = cross_repo_count_edges(&fixture, "chan-test-source", "CROSS_CHANNEL");
+    int tgt_edges = cross_repo_count_edges(&fixture, "chan-test-target", "CROSS_CHANNEL");
     cross_repo_fixture_end(&fixture);
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.channel_edges, 0);
-    ASSERT_EQ(emitted, 0);
+    ASSERT_EQ(src_edges, 0);
+    ASSERT_EQ(tgt_edges, 0);
     PASS();
 }
 
-/* Control: the identical fixture outside tests/ still produces the edge, so a
- * regression cannot hide behind a filter that drops everything. */
-TEST(cross_repo_keeps_channel_emitted_from_production_code) {
+/* The mirror case on the broker side. cross_channel_same_name_and_transport_links
+ * is the control: the identical fixture outside tests/ still links, so a filter
+ * that dropped everything cannot pass green. */
+TEST(cross_channel_ignores_listener_in_a_test_file) {
     cross_repo_fixture_t fixture;
     bool setup = cross_repo_fixture_begin(&fixture) &&
-                 cross_repo_seed_channel_pair_files(&fixture, "chan-prod-source", "chan-prod-target",
-                                                    "comments.moderation.queue", "src/worker.py",
-                                                    "src/consumer.ts");
+                 cross_repo_seed_channel_side(&fixture, "chan-tlist-source", "new_comment",
+                                              "message_type", "EMITS", "publish.py") &&
+                 cross_repo_seed_channel_side(&fixture, "chan-tlist-target", "new_comment",
+                                              "message_type", "LISTENS_ON",
+                                              "src/__tests__/consumer.test.ts");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
-        FAIL("failed to seed production emitter fixture");
+        FAIL("failed to seed test-file listener fixture");
     }
 
-    const char *target = "chan-prod-target";
-    cbm_cross_repo_result_t result = cbm_cross_repo_match("chan-prod-source", &target, 1);
+    const char *target = "chan-tlist-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("chan-tlist-source", &target, 1);
     cross_repo_fixture_end(&fixture);
 
     ASSERT_FALSE(result.failed);
-    ASSERT_EQ(result.channel_edges, 1);
+    ASSERT_EQ(result.channel_edges, 0);
     PASS();
 }
 
 SUITE(cross_repo) {
-    RUN_TEST(cross_repo_ignores_channel_emitted_from_a_test_file);
-    RUN_TEST(cross_repo_keeps_channel_emitted_from_production_code);
     RUN_TEST(cross_repo_ignores_http_call_declared_in_a_test_file);
     RUN_TEST(cross_repo_ignores_route_declared_in_a_test_file);
+    RUN_TEST(cross_channel_ignores_emitter_in_a_test_file);
+    RUN_TEST(cross_channel_ignores_listener_in_a_test_file);
     RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
@@ -710,4 +750,6 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);
     RUN_TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_target);
     RUN_TEST(cross_repo_pre_cancel_preserves_existing_cross_edges);
+    RUN_TEST(cross_channel_same_name_and_transport_links);
+    RUN_TEST(cross_channel_same_name_different_transport_does_not_link);
 }

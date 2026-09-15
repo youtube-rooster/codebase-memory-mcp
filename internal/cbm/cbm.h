@@ -319,6 +319,10 @@ typedef struct {
 typedef enum {
     CBM_STRREF_URL = 0,    // REST path or full URL
     CBM_STRREF_CONFIG = 1, // config file path or env var key
+    /* A dotted symbol bound to a string literal (`Queues.ALL_PROCESSED =
+     * "all-processed.queue"`).  The file that DEFINES it is never the file
+     * that USES it, so the binding has to travel to a project-wide pass. */
+    CBM_STRREF_SYMBOL = 2,
 } CBMStringRefKind;
 
 typedef struct {

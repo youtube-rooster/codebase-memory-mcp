@@ -14,9 +14,11 @@ import argparse
 import os
 import pathlib
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -50,6 +52,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", required=True, type=int)
     parser.add_argument("--slow-timeout", required=True, type=int)
     parser.add_argument("--kill-grace", required=True, type=int)
+    parser.add_argument(
+        "--isolate-namespace",
+        action="store_true",
+        help=(
+            "give every suite its own CBM_RUNTIME_DIR and CBM_CACHE_DIR under a "
+            "fresh temp directory, so suites that rendezvous through the "
+            "per-account daemon runtime namespace (or the default cache) can "
+            "overlap without sharing sockets, locks, or graph DBs"
+        ),
+    )
     parser.add_argument(
         "--test-post-exit-barrier-dir",
         type=pathlib.Path,
@@ -91,11 +103,33 @@ def append_log(path: pathlib.Path, message: str) -> None:
         stream.write("\n")
 
 
+def suite_namespace_env(base: pathlib.Path, suite: str) -> dict[str, str]:
+    """Build a per-suite environment whose daemon rendezvous and cache are private.
+
+    Both variables are resolved at the single product funnel
+    (cbm_daemon_bootstrap_endpoint_new for the runtime dir, the cache-dir lookup
+    for CBM_CACHE_DIR) and inherited by every re-exec the suite performs, so the
+    whole process tree of one suite shares one private namespace and no two
+    suites share any. The directories live under the system temp dir — the same
+    ancestry the tests' own cbm_mkdtemp parents use — created 0700 so the
+    daemon's private-directory validation accepts them.
+    """
+    runtime_dir = base / suite / "runtime"
+    cache_dir = base / suite / "cache"
+    runtime_dir.mkdir(parents=True, mode=0o700)
+    cache_dir.mkdir(parents=True, mode=0o700)
+    env = dict(os.environ)
+    env["CBM_RUNTIME_DIR"] = str(runtime_dir)
+    env["CBM_CACHE_DIR"] = str(cache_dir)
+    return env
+
+
 def start_suite(
     suite: str,
     runner_command: list[str],
     log_dir: pathlib.Path,
     timeout: int,
+    env: dict[str, str] | None = None,
 ) -> ActiveSuite | None:
     log_path = log_dir / f"{suite}.log"
     log_file = log_path.open("wb")
@@ -103,6 +137,8 @@ def start_suite(
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
     }
+    if env is not None:
+        popen_args["env"] = env
     if os.name == "nt":
         popen_args["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
@@ -363,6 +399,9 @@ def run_wave(args: argparse.Namespace) -> None:
     args.results_file.touch(exist_ok=True)
     pending = list(suites)
     active: dict[str, ActiveSuite] = {}
+    namespace_base: pathlib.Path | None = None
+    if args.isolate_namespace and suites:
+        namespace_base = pathlib.Path(tempfile.mkdtemp(prefix="cbm-wave-ns-"))
     try:
         while pending or active:
             while pending and len(active) < args.jobs:
@@ -375,6 +414,11 @@ def run_wave(args: argparse.Namespace) -> None:
                     list(args.runner_command),
                     args.log_dir,
                     timeout,
+                    env=(
+                        suite_namespace_env(namespace_base, suite)
+                        if namespace_base is not None
+                        else None
+                    ),
                 )
                 if started is None:
                     record_start_failure(suite, args.log_dir, args.results_file)
@@ -421,6 +465,10 @@ def run_wave(args: argparse.Namespace) -> None:
                     running.log_file.close()
                 except OSError as exc:
                     cleanup_errors.append(f"{running.name} log close: {exc}")
+        if namespace_base is not None:
+            # Suites stop their own daemons; anything left behind is dead
+            # sockets and cache files in a namespace nobody will look up again.
+            shutil.rmtree(namespace_base, ignore_errors=True)
         if cleanup_errors:
             raise RuntimeError(
                 "parallel scheduler cleanup failed: " + "; ".join(cleanup_errors)

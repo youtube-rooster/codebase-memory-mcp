@@ -688,7 +688,10 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
                              (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
-    if (def->route_path && def->route_path[0] != '\0') {
+    /* A route decorated inside a test file is a fixture standing in for the
+     * service, not a surface the service exposes. */
+    const char *route_owner = def->file_path ? def->file_path : fi->rel_path;
+    if (def->route_path && def->route_path[0] != '\0' && !cbm_is_test_path(route_owner)) {
         const char *rm = def->route_method ? def->route_method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];
@@ -702,7 +705,8 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
         char hprops[CBM_SZ_512];
         char esc_h[CBM_SZ_512];
         cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
-        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}", esc_h);
+        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}",
+                 esc_h, route_owner);
         cbm_gbuf_insert_edge(ws->local_gbuf, func_id, route_id, "HANDLES", hprops);
     }
 }
@@ -1546,6 +1550,478 @@ static bool is_path_keyword(const char *keyword) {
     return false;
 }
 
+/* Defined below with the URL helpers; needed here to validate a mount path. */
+static bool is_junk_url(const char *s);
+
+/* ── Express router mounts ────────────────────────────────────────
+ *
+ * `app.use("/org", authMiddleware, orgRoutes)` is what gives a router's routes
+ * their real path.  Without it every route in orgRoutes.js is recorded as the
+ * fragment the file declares ("/accounts"), which no caller can ever match: the
+ * client asks for "/org/accounts".  The mount is a plain call, so it is
+ * captured here and resolved into full paths by the route-node pass, which is
+ * the first point where both the mount and the mounted file are in one graph.
+ *
+ * Real mounts are template literals whose head is an environment-dependent
+ * prefix variable (`\u0060${prefix}/org\u0060`).  That leading substitution is
+ * dropped rather than canonicalised: turning it into a wildcard segment would
+ * produce "/{}/org/accounts" and match nothing. */
+/* Receiver of a member call: the text before the final dot. */
+static const char *callee_receiver_tail(const char *callee_name, char *buf, size_t buf_sz) {
+    if (!callee_name) {
+        return "";
+    }
+    const char *dot = strrchr(callee_name, '.');
+    if (!dot) {
+        return "";
+    }
+    size_t len = (size_t)(dot - callee_name);
+    const char *start = callee_name;
+    for (size_t i = 0; i < len; i++) {
+        if (callee_name[i] == '.') {
+            start = callee_name + i + SKIP_ONE;
+        }
+    }
+    len = (size_t)(dot - start);
+    if (len >= buf_sz) {
+        len = buf_sz - SKIP_ONE;
+    }
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static bool receiver_is_router_like(const char *tail) {
+    if (!tail || !tail[0]) {
+        return false;
+    }
+    if (strcmp(tail, "app") == 0 || strcmp(tail, "server") == 0 || strcmp(tail, "r") == 0 ||
+        strcmp(tail, "Route") == 0 || strcmp(tail, "route") == 0 ||
+        strcmp(tail, "fastify") == 0 || strcmp(tail, "mux") == 0 ||
+        /* Fastify plugins receive the encapsulated instance as a parameter,
+         * conventionally `instance` (the docs' name) or `scope` — rchat-identity
+         * registers `scope.post('/forgot-password', …)` inside such a plugin,
+         * and gating inline handlers on router shape must not strip it. */
+        strcmp(tail, "scope") == 0 || strcmp(tail, "instance") == 0) {
+        return true;
+    }
+    size_t len = strlen(tail);
+    /* Singular `Route`/`route` suffixes are load-bearing: rcr-server names
+     * per-resource Express routers `reviewRoute`, `blocksRoute`, … and their
+     * inline handlers lose HANDLES if only the plural forms match. */
+    const char *suffixes[] = {"router", "Router", "routes", "Routes",
+                              "Route",  "route",  NULL};
+    for (int i = 0; suffixes[i]; i++) {
+        size_t sl = strlen(suffixes[i]);
+        if (len >= sl && strcmp(tail + len - sl, suffixes[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An inline handler (`(req, res) => ...`, `function (req, res) {}`, or an
+ * `async` form) only ever appears in a registration. */
+static bool arg_is_inline_function(const char *expr) {
+    if (!expr || !expr[0]) {
+        return false;
+    }
+    if (strstr(expr, "=>") != NULL) {
+        return true;
+    }
+    return strncmp(expr, "function", 8) == 0 || strncmp(expr, "async", 5) == 0;
+}
+
+/* An inline handler after the path argument (Fastify's dominant shape:
+ * `app.get('/health', async () => ...)`, or in arg 3 behind an options object:
+ * `app.get('/admin', { preHandler: guard }, async (req) => ...)`).  Such a call
+ * is a registration whose handler has no name to resolve, so the HANDLES edge
+ * must fall back to the enclosing scope — see the registration emitters. */
+bool cbm_pipeline_call_has_inline_handler(const CBMCall *call) {
+    if (!call) {
+        return false;
+    }
+    for (int i = SKIP_ONE; i < call->arg_count; i++) {
+        if (arg_is_inline_function(call->args[i].expr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Registration-shaped callee: a router-like receiver (`app.get`,
+ * `router.post`, PHP's `Route::get`) or a bare framework call with no receiver
+ * at all (which only reaches route classification when a framework vouched for
+ * it).  The inline-handler HANDLES fallback is gated on this: an inline
+ * callback alone is not evidence enough — `cache.get('/users', async () => …)`
+ * is a memoizer wearing the registration shape, and a HANDLES edge would
+ * promote that pre-existing misclassification into a confident cross-repo
+ * match.  The (tolerated) Route node still appears; withholding HANDLES is
+ * what keeps find_route_handler from ever reporting it. */
+bool cbm_pipeline_callee_is_router_shaped(const char *callee_name) {
+    if (!callee_name || !callee_name[0]) {
+        return false;
+    }
+    const char *coloncolon = strstr(callee_name, "::");
+    if (coloncolon) {
+        char facade[CBM_SZ_128];
+        size_t len = (size_t)(coloncolon - callee_name);
+        if (len >= sizeof(facade)) {
+            len = sizeof(facade) - SKIP_ONE;
+        }
+        memcpy(facade, callee_name, len);
+        facade[len] = '\0';
+        return receiver_is_router_like(facade);
+    }
+    if (strchr(callee_name, '.') == NULL) {
+        return true;
+    }
+    char tail[CBM_SZ_128];
+    return receiver_is_router_like(callee_receiver_tail(callee_name, tail, sizeof(tail)));
+}
+
+/* Does this argument name a function that exists in the graph? */
+static bool arg_resolves_to_function(const char *ident, const cbm_registry_t *registry,
+                                     const cbm_gbuf_t *gbuf, const char *module_qn,
+                                     const char **ik, const char **iv, int ic) {
+    if (!ident || !ident[0] || !registry || !gbuf) {
+        return false;
+    }
+    cbm_resolution_t res = cbm_registry_resolve(registry, ident, module_qn, ik, iv, ic);
+    if (!res.qualified_name || !res.qualified_name[0]) {
+        return false;
+    }
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, res.qualified_name);
+    if (!node || !node->label) {
+        return false;
+    }
+    return strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0;
+}
+
+bool cbm_pipeline_is_route_registration(const CBMCall *call, const cbm_registry_t *registry,
+                                        const cbm_gbuf_t *gbuf, const char *module_qn,
+                                        const char **imp_keys, const char **imp_vals,
+                                        int imp_count) {
+    if (!call) {
+        return false;
+    }
+    char tail[CBM_SZ_128];
+    if (receiver_is_router_like(callee_receiver_tail(call->callee_name, tail, sizeof(tail)))) {
+        return true;
+    }
+    /* A non-member call (`get("/x", h)`) carries no receiver evidence; the
+     * framework tables already vouch for those, so keep them registrations. */
+    if (call->callee_name && strchr(call->callee_name, '.') == NULL &&
+        strstr(call->callee_name, "::") == NULL) {
+        return true;
+    }
+    if (cbm_pipeline_call_has_inline_handler(call)) {
+        return true;
+    }
+    /* A router bound to a name we cannot recognise (`const v1 = Router()`) is
+     * still a registration when the argument after the path is a real function.
+     * A client call puts a request body there, which resolves to nothing. */
+    return arg_resolves_to_function(call->second_arg_name, registry, gbuf, module_qn, imp_keys,
+                                    imp_vals, imp_count);
+}
+
+static bool callee_has_suffix(const char *callee_name, const char *suffix) {
+    if (!callee_name) {
+        return false;
+    }
+    size_t len = strlen(callee_name);
+    size_t slen = strlen(suffix);
+    return len >= slen && strcmp(callee_name + len - slen, suffix) == 0;
+}
+
+bool cbm_pipeline_is_router_mount(const char *callee_name) {
+    /* `.use` is Express (`app.use("/org", orgRoutes)`); `.register` is Fastify
+     * (`app.register(socialModule, { prefix: '/social' })`).  Both only become
+     * a MOUNTS edge when the emitter proves the shape — a path (or a prefix
+     * option) plus an identifier that resolves to a module with a file. */
+    return callee_has_suffix(callee_name, ".use") || callee_has_suffix(callee_name, ".register");
+}
+
+/* Extract the mount path from a raw argument.  Returns false when the argument
+ * is not a path (middleware call, bare identifier, options object). */
+static bool mount_prefix_from_arg(const char *raw, char *out, int out_sz) {
+    if (!raw) {
+        return false;
+    }
+    const char *p = raw;
+    if (*p == '`' || *p == '"' || *p == '\'') {
+        p++;
+    }
+    /* Drop a leading `${...}` — the deploy-dependent prefix variable. */
+    if (*p == '$' && *(p + SKIP_ONE) == '{') {
+        p += PAIR_LEN;
+        while (*p && *p != '}') {
+            p++;
+        }
+        if (*p == '}') {
+            p++;
+        }
+    }
+    if (*p != '/') {
+        return false;
+    }
+    int oi = 0;
+    while (*p && oi < out_sz - PAIR_LEN) {
+        if (*p == '$' && *(p + SKIP_ONE) == '{') {
+            /* Interior substitution is a real path parameter: `${liveId}`. */
+            out[oi++] = ':';
+            p += PAIR_LEN;
+            while (*p && *p != '}' && oi < out_sz - PAIR_LEN) {
+                out[oi++] = *p++;
+            }
+            if (*p == '}') {
+                p++;
+            }
+        } else if (*p == '`' || *p == '"' || *p == '\'' || *p == '?') {
+            break;
+        } else {
+            out[oi++] = *p++;
+        }
+    }
+    /* A bare "/" mount adds nothing and would double every slash. */
+    while (oi > SKIP_ONE && out[oi - SKIP_ONE] == '/') {
+        oi--;
+    }
+    out[oi] = '\0';
+    return oi > SKIP_ONE && !is_junk_url(out);
+}
+
+/* Read a JSON string property ("key":"value") out of an edge properties blob. */
+static bool mount_json_str_prop(const char *json, const char *key, char *out, size_t out_sz) {
+    if (!json || !key || !out || out_sz == 0) {
+        return false;
+    }
+    char needle[CBM_SZ_64];
+    int nn = snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    if (nn <= 0 || (size_t)nn >= sizeof(needle)) {
+        return false;
+    }
+    const char *p = strstr(json, needle);
+    if (!p) {
+        return false;
+    }
+    p += nn;
+    size_t oi = 0;
+    while (*p && *p != '"' && oi < out_sz - SKIP_ONE) {
+        if (*p == '\\' && *(p + SKIP_ONE)) {
+            p++;
+        }
+        out[oi++] = *p++;
+    }
+    out[oi] = '\0';
+    return oi > 0;
+}
+
+/* Resolve a router identifier to the module it was imported from.
+ *
+ * The registry cannot do this: a router arrives as a default import
+ * (`import orgRoutes from "./routes/orgRoutes.js"`), which binds a local name to
+ * a module rather than to an indexed symbol, so resolution comes back empty and
+ * the import map handed to the call pass is empty at this point.  The IMPORTS
+ * edge already records the binding under `local_name`, which is exactly the
+ * identifier written at the mount site. */
+static const cbm_gbuf_node_t *mount_router_by_import(const cbm_gbuf_t *main_gbuf,
+                                                     const char *file_path, const char *ident) {
+    if (!main_gbuf || !file_path || !file_path[0] || !ident) {
+        return NULL;
+    }
+    /* IMPORTS edges hang off the file's __file__ node, whose QN this function
+     * cannot rebuild without the project name — so match on the file path of
+     * whatever node the edge starts from. */
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_type(main_gbuf, "IMPORTS", &edges, &count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        char local[CBM_SZ_256];
+        if (!mount_json_str_prop(edges[i]->properties_json, "local_name", local, sizeof(local))) {
+            continue;
+        }
+        if (strcmp(local, ident) != 0) {
+            continue;
+        }
+        const cbm_gbuf_node_t *importer = cbm_gbuf_find_by_id(main_gbuf, edges[i]->source_id);
+        if (!importer || !importer->file_path || strcmp(importer->file_path, file_path) != 0) {
+            continue;
+        }
+        return cbm_gbuf_find_by_id(main_gbuf, edges[i]->target_id);
+    }
+    return NULL;
+}
+
+/* Is this argument a bare identifier (a router reference), as opposed to a
+ * string, a middleware invocation, or an inline function? */
+static bool is_bare_identifier_arg(const char *expr) {
+    if (!expr || !expr[0]) {
+        return false;
+    }
+    if (expr[0] == '/' || expr[0] == '"' || expr[0] == '\'' || expr[0] == '`' || expr[0] == '{' ||
+        expr[0] == '[') {
+        return false;
+    }
+    for (const char *c = expr; *c; c++) {
+        if (*c == '(' || *c == ')' || *c == ' ' || *c == '=' || *c == '>') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Fastify plugins are frequently factory calls, not bare references:
+ * `app.register(authModule({ repo, issuer }), { prefix: '/auth' })`.  The
+ * plugin the factory returns is defined in the factory's own file, so the
+ * factory NAME carries the same file association a bare identifier would —
+ * peel it off the leading `ident(` and resolve it like any router reference.
+ * Returns the identifier (arena-free, written into buf) or NULL when the
+ * expression is not a plain-identifier call. */
+static const char *mount_router_ident(const char *expr, char *buf, size_t buf_sz) {
+    if (is_bare_identifier_arg(expr)) {
+        return expr;
+    }
+    if (!expr || !expr[0]) {
+        return NULL;
+    }
+    char c0 = expr[0];
+    if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_' || c0 == '$')) {
+        return NULL;
+    }
+    size_t i = 0;
+    while (expr[i] && i < buf_sz - SKIP_ONE) {
+        char c = expr[i];
+        bool ident_char = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_' || c == '$';
+        if (!ident_char) {
+            break;
+        }
+        buf[i] = c;
+        i++;
+    }
+    if (i == 0 || expr[i] != '(') {
+        return NULL;
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+/* Fastify keeps the mount path in an options object, not a positional path:
+ * `app.register(socialModule, { prefix: '/social' })`.  Pull the prefix value
+ * out of the first object-literal argument that carries a `prefix` key.  The
+ * value re-uses mount_prefix_from_arg, so template literals with a leading
+ * deploy-dependent substitution behave exactly like an Express mount path.
+ * A register without a prefix mounts at the root — the fragments already carry
+ * their full paths, so no MOUNTS edge is needed (or emitted). */
+static bool register_prefix_from_args(const CBMCall *call, char *out, int out_sz) {
+    for (int ai = SKIP_ONE; ai < call->arg_count; ai++) {
+        const char *expr = call->args[ai].expr;
+        if (!expr || expr[0] != '{') {
+            continue;
+        }
+        /* Scan every occurrence of the word inside this options object:
+         * a decoy key sharing the substring (`prefixTrailingSlash` before
+         * `prefix`) must not abort the whole argument — the real key can
+         * still follow in the same string. */
+        for (const char *hit = strstr(expr, "prefix"); hit;
+             hit = strstr(hit + SKIP_ONE, "prefix")) {
+            const char *p = hit;
+            /* Key position only: `prefix:`, `'prefix':`, `"prefix":` — not a
+             * longer key that merely contains the word (`routePrefix` starts
+             * elsewhere, but `xprefix` would land here, so check the
+             * preceding character). */
+            char before = *(p - SKIP_ONE);
+            if (before != '{' && before != ',' && before != ' ' &&
+                before != '\t' && before != '\n' && before != '"' &&
+                before != '\'') {
+                continue;
+            }
+            p += strlen("prefix");
+            while (*p == '"' || *p == '\'' || *p == ' ' || *p == '\t') {
+                p++;
+            }
+            if (*p != ':') {
+                continue;
+            }
+            p++;
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+                p++;
+            }
+            if (mount_prefix_from_arg(p, out, out_sz)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Emit one MOUNTS edge per router argument of an app.use(path, ...) call, or
+ * one for the plugin of an app.register(plugin, { prefix }) call. */
+void cbm_pipeline_emit_router_mount(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
+                                    const CBMCall *call, const char *module_qn,
+                                    const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
+                                    const char **ik, const char **iv, int ic) {
+    if (call->arg_count < PAIR_LEN) {
+        return;
+    }
+    /* The two shapes put the two facts in opposite positions: Express carries
+     * path-then-routers, Fastify carries plugin-then-options.  The candidate
+     * range below is chosen accordingly. */
+    bool is_register = callee_has_suffix(call->callee_name, ".register");
+    char prefix[CBM_SZ_256];
+    if (is_register) {
+        if (!register_prefix_from_args(call, prefix, (int)sizeof(prefix))) {
+            return;
+        }
+    } else {
+        const CBMCallArg *first = &call->args[0];
+        const char *raw = first->value ? first->value : first->expr;
+        if (!mount_prefix_from_arg(raw, prefix, (int)sizeof(prefix))) {
+            return;
+        }
+    }
+    char esc_prefix[CBM_SZ_512];
+    cbm_json_escape(esc_prefix, sizeof(esc_prefix), prefix);
+
+    /* Every trailing identifier is a candidate router: one app.use can mount
+     * several (brand-exposure mounts captures and report on the same path).
+     * A register's plugin is argument 0 and only argument 0. */
+    int ai_start = is_register ? 0 : SKIP_ONE;
+    int ai_end = is_register ? SKIP_ONE : call->arg_count;
+    for (int ai = ai_start; ai < ai_end; ai++) {
+        const CBMCallArg *ca = &call->args[ai];
+        char ident_buf[CBM_SZ_256];
+        /* Express (`app.use`) only ever mounts a bare reference; a call there
+         * is middleware being invoked, never a router.  Fastify's register
+         * additionally takes a factory call in plugin position. */
+        const char *ident = is_register ? mount_router_ident(ca->expr, ident_buf,
+                                                             sizeof(ident_buf))
+                                        : (is_bare_identifier_arg(ca->expr) ? ca->expr : NULL);
+        if (!ident) {
+            continue;
+        }
+        const cbm_gbuf_node_t *router = mount_router_by_import(main_gbuf, source->file_path, ident);
+        if (!router) {
+            /* Same-file router, or a language whose imports the registry does
+             * resolve — fall back to ordinary symbol resolution. */
+            cbm_resolution_t rres = cbm_registry_resolve(registry, ident, module_qn, ik, iv, ic);
+            if (rres.qualified_name && rres.qualified_name[0]) {
+                router = cbm_gbuf_find_by_qn(main_gbuf, rres.qualified_name);
+            }
+        }
+        if (!router || !router->file_path || !router->file_path[0]) {
+            continue;
+        }
+        char props[CBM_SZ_1K];
+        snprintf(props, sizeof(props), "{\"prefix\":\"%s\",\"via\":\"router_mount\"}",
+                 esc_prefix);
+        cbm_gbuf_insert_edge(gbuf, source->id, router->id, "MOUNTS", props);
+    }
+}
+
 static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler) {
     *out_handler = NULL;
     /* 1. First string arg starting with / */
@@ -1702,6 +2178,11 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
                                     const char *handler_ref, const char *module_qn,
                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                                     const char **ik, const char **iv, int ic) {
+    /* A test file registers routes on a throwaway app to exercise handlers;
+     * those are fixtures, not the surface the service exposes. */
+    if (source && source->file_path && cbm_is_test_path(source->file_path)) {
+        return;
+    }
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
@@ -1719,19 +2200,47 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
+    /* Every HANDLES edge carries the file that DECLARED the registration
+     * (source's file).  Fragment Route nodes are deduped by method+path alone,
+     * so handlers from unrelated files pile onto one shared node; the
+     * mount-composition pass uses decl_file to carry over only the handlers
+     * the mounted router file actually registered. */
+    char esc_df[CBM_SZ_512];
+    cbm_json_escape(esc_df, sizeof(esc_df), source->file_path ? source->file_path : "");
+    bool handled = false;
     if (handler_ref && handler_ref[0] != '\0') {
         cbm_resolution_t hres = cbm_registry_resolve(registry, handler_ref, module_qn, ik, iv, ic);
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
-                char hp[CBM_SZ_1K]; /* must exceed escaped value + wrapper or snprintf cuts the
+                char hp[CBM_SZ_2K]; /* must exceed escaped values + wrapper or snprintf cuts the
                                        closing brace */
                 char esc_h2[CBM_SZ_512];
                 cbm_json_escape(esc_h2, sizeof(esc_h2), hres.qualified_name);
-                snprintf(hp, sizeof(hp), "{\"handler\":\"%s\"}", esc_h2);
+                snprintf(hp, sizeof(hp), "{\"handler\":\"%s\",\"decl_file\":\"%s\"}", esc_h2,
+                         esc_df);
                 cbm_gbuf_insert_edge(gbuf, h->id, rid, "HANDLES", hp);
+                handled = true;
             }
         }
+    }
+    /* Inline handler (`app.get('/x', async () => ...)`) — Fastify's dominant
+     * shape, and common in Express too.  There is no name to resolve, so the
+     * route would carry no HANDLES at all, and cross-repo matching
+     * (find_route_handler) refuses routes without one: an all-inline service
+     * silently produces zero matches.  The enclosing scope — the plugin
+     * function, or the file for a top-level registration — owns the handler's
+     * code and carries the name and file_path the cross-repo report needs. */
+    if (!handled && cbm_pipeline_call_has_inline_handler(call) &&
+        cbm_pipeline_callee_is_router_shaped(call->callee_name)) {
+        char hp[CBM_SZ_2K];
+        char esc_h2[CBM_SZ_512];
+        cbm_json_escape(esc_h2, sizeof(esc_h2),
+                        source->qualified_name ? source->qualified_name : "");
+        snprintf(hp, sizeof(hp),
+                 "{\"handler\":\"%s\",\"source\":\"inline_handler\",\"decl_file\":\"%s\"}",
+                 esc_h2, esc_df);
+        cbm_gbuf_insert_edge(gbuf, source->id, rid, "HANDLES", hp);
     }
 }
 
@@ -2026,6 +2535,12 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
         const char *route_path = find_route_path_in_args(call, &handler_ref);
+        if (route_path && !cbm_pipeline_is_route_registration(call, registry, main_gbuf,
+                                                              module_qn, imp_keys, imp_vals,
+                                                              imp_count)) {
+            emit_http_async_service_edge(gbuf, source, call, res, CBM_SVC_HTTP, route_path);
+            return;
+        }
         if (route_path) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count);
@@ -2484,6 +2999,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
          * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
          * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+        /* Router mounts are classified by nothing: a mount matches no service
+         * pattern and carries no verb suffix, so the dispatcher below never
+         * routes it to emit_service_edge.  Record it here, where every call is
+         * still visible, and let the normal classification continue. */
+        if (cbm_pipeline_is_router_mount(call->callee_name)) {
+            cbm_pipeline_emit_router_mount(ws->local_edge_buf, source_node, call, module_qn,
+                                           rc->registry, rc->main_gbuf, imp_keys, imp_vals,
+                                           imp_count);
+        }
+
         cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;
