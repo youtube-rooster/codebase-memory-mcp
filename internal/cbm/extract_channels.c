@@ -532,7 +532,8 @@ static const char *js_classify_receiver_depth(CBMExtractCtx *ctx, TSNode object_
      * to it resolved.  A chained call inherits the classification of the handle
      * it was chained onto. */
     enum { JS_RECEIVER_CHAIN_MAX = 4 };
-    if (depth < JS_RECEIVER_CHAIN_MAX && strcmp(ts_node_type(object_node), "call_expression") == 0) {
+    if (depth < JS_RECEIVER_CHAIN_MAX &&
+        strcmp(ts_node_type(object_node), "call_expression") == 0) {
         TSNode fn = ts_node_child_by_field_name(object_node, TS_FIELD("function"));
         if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
             TSNode inner = ts_node_child_by_field_name(fn, TS_FIELD("object"));
@@ -574,9 +575,8 @@ static const char *js_classify_receiver_depth(CBMExtractCtx *ctx, TSNode object_
      * both `conn.channel.sendToQueue(...)` and the common consumer shape where
      * the handle is a field (`this.queue.consume(...)`), so the LISTEN side of
      * every queue was invisible while the EMIT side resolved. */
-    if (strcmp(tail, "channel") == 0 || strcmp(tail, "ch") == 0 ||
-        strcmp(tail, "queue") == 0 || strcmp(tail, "rabbitmq") == 0 ||
-        strcmp(tail, "amqp") == 0 || strcmp(tail, "broker") == 0 ||
+    if (strcmp(tail, "channel") == 0 || strcmp(tail, "ch") == 0 || strcmp(tail, "queue") == 0 ||
+        strcmp(tail, "rabbitmq") == 0 || strcmp(tail, "amqp") == 0 || strcmp(tail, "broker") == 0 ||
         strcmp(tail, "mq") == 0) {
         return "rabbitmq";
     }
@@ -955,7 +955,7 @@ static int py_classify_direction(const char *transport, const char *method) {
 /* Keyword arguments that name a channel, most specific first: `routing_key`
  * is what a consumer binds to, `exchange` only the broker it binds through. */
 static bool py_is_channel_kwarg(const char *key) {
-    static const char *keys[] = {"routing_key", "queue_name", "queue",  "topic",
+    static const char *keys[] = {"routing_key", "queue_name", "queue",   "topic",
                                  "channel",     "event",      "subject", "exchange",
                                  "QueueUrl",    "TopicArn",   NULL};
     for (int i = 0; keys[i]; i++) {
@@ -1059,8 +1059,8 @@ static const char *py_value_as_channel(CBMExtractCtx *ctx, TSNode value,
 
 /* Emit one channel per channel-naming keyword argument.  Returns how many. */
 static int py_emit_kwarg_channels(CBMExtractCtx *ctx, TSNode args, const char *transport,
-                                  CBMChannelDirection direction,
-                                  const chan_const_table_t *consts, TSNode call) {
+                                  CBMChannelDirection direction, const chan_const_table_t *consts,
+                                  TSNode call) {
     int emitted = 0;
     uint32_t n = ts_node_named_child_count(args);
     for (uint32_t i = 0; i < n; i++) {
@@ -1323,7 +1323,8 @@ static void publish_class_attr_bindings(CBMExtractCtx *ctx) {
             if (strcmp(lk, "attribute") == 0) {
                 TSNode obj = ts_node_child_by_field_name(left, TS_FIELD("object"));
                 TSNode att = ts_node_child_by_field_name(left, TS_FIELD("attribute"));
-                char *obj_text = ts_node_is_null(obj) ? NULL : cbm_node_text(ctx->arena, obj, ctx->source);
+                char *obj_text =
+                    ts_node_is_null(obj) ? NULL : cbm_node_text(ctx->arena, obj, ctx->source);
                 if (obj_text && strcmp(obj_text, "self") == 0 && !ts_node_is_null(att)) {
                     target = att;
                     self_attr = true;

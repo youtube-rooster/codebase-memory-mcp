@@ -604,11 +604,12 @@ static cr_match_result_t match_http_routes(cbm_store_t *src_store, const char *s
      * a suite seeds sample paths as string literals and the matcher cannot tell
      * those from a client call without knowing where the call was written. */
     sqlite3_stmt *s = NULL;
-    if (sqlite3_prepare_v2(src_db,
-                           "SELECT e.source_id, e.target_id, e.properties, n.file_path FROM edges e "
-                           "LEFT JOIN nodes n ON n.id = e.source_id "
-                           "WHERE e.project = ?1 AND e.type = 'HTTP_CALLS' ORDER BY e.id",
-                           CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(
+            src_db,
+            "SELECT e.source_id, e.target_id, e.properties, n.file_path FROM edges e "
+            "LEFT JOIN nodes n ON n.id = e.source_id "
+            "WHERE e.project = ?1 AND e.type = 'HTTP_CALLS' ORDER BY e.id",
+            CBM_NOT_FOUND, &s, NULL) != SQLITE_OK) {
         return cr_match_finish(ctx, 0, true);
     }
     if (sqlite3_bind_text(s, SKIP_ONE, src_project, CBM_NOT_FOUND, SQLITE_STATIC) != SQLITE_OK) {
@@ -833,8 +834,8 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
     }
     if (sqlite3_bind_text(tq, SKIP_ONE, tgt_project, CBM_NOT_FOUND, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_bind_text(tq, PAIR_LEN, channel_name, CBM_NOT_FOUND, SQLITE_STATIC) != SQLITE_OK ||
-        sqlite3_bind_text(tq, CR_COL_3, transport ? transport : "", CBM_NOT_FOUND,
-                          SQLITE_STATIC) != SQLITE_OK) {
+        sqlite3_bind_text(tq, CR_COL_3, transport ? transport : "", CBM_NOT_FOUND, SQLITE_STATIC) !=
+            SQLITE_OK) {
         sqlite3_finalize(tq);
         return CBM_STORE_ERR;
     }

@@ -705,8 +705,9 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
         char hprops[CBM_SZ_512];
         char esc_h[CBM_SZ_512];
         cbm_json_escape(esc_h, sizeof(esc_h), def->qualified_name);
-        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}",
-                 esc_h, route_owner);
+        snprintf(hprops, sizeof(hprops),
+                 "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}", esc_h,
+                 route_owner);
         cbm_gbuf_insert_edge(ws->local_gbuf, func_id, route_id, "HANDLES", hprops);
     }
 }
@@ -1596,8 +1597,8 @@ static bool receiver_is_router_like(const char *tail) {
         return false;
     }
     if (strcmp(tail, "app") == 0 || strcmp(tail, "server") == 0 || strcmp(tail, "r") == 0 ||
-        strcmp(tail, "Route") == 0 || strcmp(tail, "route") == 0 ||
-        strcmp(tail, "fastify") == 0 || strcmp(tail, "mux") == 0 ||
+        strcmp(tail, "Route") == 0 || strcmp(tail, "route") == 0 || strcmp(tail, "fastify") == 0 ||
+        strcmp(tail, "mux") == 0 ||
         /* Fastify plugins receive the encapsulated instance as a parameter,
          * conventionally `instance` (the docs' name) or `scope` — rchat-identity
          * registers `scope.post('/forgot-password', …)` inside such a plugin,
@@ -1609,8 +1610,7 @@ static bool receiver_is_router_like(const char *tail) {
     /* Singular `Route`/`route` suffixes are load-bearing: rcr-server names
      * per-resource Express routers `reviewRoute`, `blocksRoute`, … and their
      * inline handlers lose HANDLES if only the plural forms match. */
-    const char *suffixes[] = {"router", "Router", "routes", "Routes",
-                              "Route",  "route",  NULL};
+    const char *suffixes[] = {"router", "Router", "routes", "Routes", "Route", "route", NULL};
     for (int i = 0; suffixes[i]; i++) {
         size_t sl = strlen(suffixes[i]);
         if (len >= sl && strcmp(tail + len - sl, suffixes[i]) == 0) {
@@ -1682,8 +1682,8 @@ bool cbm_pipeline_callee_is_router_shaped(const char *callee_name) {
 
 /* Does this argument name a function that exists in the graph? */
 static bool arg_resolves_to_function(const char *ident, const cbm_registry_t *registry,
-                                     const cbm_gbuf_t *gbuf, const char *module_qn,
-                                     const char **ik, const char **iv, int ic) {
+                                     const cbm_gbuf_t *gbuf, const char *module_qn, const char **ik,
+                                     const char **iv, int ic) {
     if (!ident || !ident[0] || !registry || !gbuf) {
         return false;
     }
@@ -1934,9 +1934,8 @@ static bool register_prefix_from_args(const CBMCall *call, char *out, int out_sz
              * elsewhere, but `xprefix` would land here, so check the
              * preceding character). */
             char before = *(p - SKIP_ONE);
-            if (before != '{' && before != ',' && before != ' ' &&
-                before != '\t' && before != '\n' && before != '"' &&
-                before != '\'') {
+            if (before != '{' && before != ',' && before != ' ' && before != '\t' &&
+                before != '\n' && before != '"' && before != '\'') {
                 continue;
             }
             p += strlen("prefix");
@@ -1997,8 +1996,7 @@ void cbm_pipeline_emit_router_mount(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
         /* Express (`app.use`) only ever mounts a bare reference; a call there
          * is middleware being invoked, never a router.  Fastify's register
          * additionally takes a factory call in plugin position. */
-        const char *ident = is_register ? mount_router_ident(ca->expr, ident_buf,
-                                                             sizeof(ident_buf))
+        const char *ident = is_register ? mount_router_ident(ca->expr, ident_buf, sizeof(ident_buf))
                                         : (is_bare_identifier_arg(ca->expr) ? ca->expr : NULL);
         if (!ident) {
             continue;
@@ -2016,8 +2014,7 @@ void cbm_pipeline_emit_router_mount(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
             continue;
         }
         char props[CBM_SZ_1K];
-        snprintf(props, sizeof(props), "{\"prefix\":\"%s\",\"via\":\"router_mount\"}",
-                 esc_prefix);
+        snprintf(props, sizeof(props), "{\"prefix\":\"%s\",\"via\":\"router_mount\"}", esc_prefix);
         cbm_gbuf_insert_edge(gbuf, source->id, router->id, "MOUNTS", props);
     }
 }
@@ -2238,8 +2235,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
         cbm_json_escape(esc_h2, sizeof(esc_h2),
                         source->qualified_name ? source->qualified_name : "");
         snprintf(hp, sizeof(hp),
-                 "{\"handler\":\"%s\",\"source\":\"inline_handler\",\"decl_file\":\"%s\"}",
-                 esc_h2, esc_df);
+                 "{\"handler\":\"%s\",\"source\":\"inline_handler\",\"decl_file\":\"%s\"}", esc_h2,
+                 esc_df);
         cbm_gbuf_insert_edge(gbuf, source->id, rid, "HANDLES", hp);
     }
 }
@@ -2535,9 +2532,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
         const char *route_path = find_route_path_in_args(call, &handler_ref);
-        if (route_path && !cbm_pipeline_is_route_registration(call, registry, main_gbuf,
-                                                              module_qn, imp_keys, imp_vals,
-                                                              imp_count)) {
+        if (route_path && !cbm_pipeline_is_route_registration(call, registry, main_gbuf, module_qn,
+                                                              imp_keys, imp_vals, imp_count)) {
             emit_http_async_service_edge(gbuf, source, call, res, CBM_SVC_HTTP, route_path);
             return;
         }
