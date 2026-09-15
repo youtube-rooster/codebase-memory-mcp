@@ -895,6 +895,40 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
                : (cr_cancel_requested(ctx) ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR);
 }
 
+/* Names a socket library reserves for its own lifecycle. Every client listens
+ * on them and any server may emit them, so a match on one of these says
+ * nothing about which two services talk. */
+static bool cr_is_transport_lifecycle_event(const char *name) {
+    static const char *const reserved[] = {
+        "connect",
+        "connection",
+        "connect_error",
+        "disconnect",
+        "disconnecting",
+        "reconnect",
+        "reconnect_attempt",
+        "reconnecting",
+        "reconnect_error",
+        "reconnect_failed",
+        "open",
+        "close",
+        "end",
+        "error",
+        "ready",
+        "ping",
+        "pong",
+        "message",
+        "newListener",
+        "removeListener",
+    };
+    for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++) {
+        if (strcmp(name, reserved[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_project,
                                         cbm_store_t *tgt_store, const char *tgt_project,
                                         cr_run_context_t *ctx) {
@@ -928,6 +962,9 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
         const char *channel_name = (const char *)sqlite3_column_text(s, SKIP_ONE);
         const char *channel_qn = (const char *)sqlite3_column_text(s, PAIR_LEN);
         if (!channel_name || !channel_qn) {
+            continue;
+        }
+        if (cr_is_transport_lifecycle_event(channel_name)) {
             continue;
         }
         int64_t channel_id = sqlite3_column_int64(s, 0);
@@ -1358,6 +1395,13 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         if (match_status == CR_RUN_OK) {
             match_status = add_match_count(
                 &result.channel_edges, match_channels(src_store, project, tgt_store, tgt, &run));
+        }
+        /* Same as the HTTP reverse pass above: a consumer-only service has no
+         * EMITS to iterate, so its own run would otherwise end with the
+         * reverse edges delete_cross_edges just wiped and nothing to put back. */
+        if (match_status == CR_RUN_OK) {
+            match_status = add_match_count(
+                &result.channel_edges, match_channels(tgt_store, tgt, src_store, project, &run));
         }
         if (match_status == CR_RUN_OK) {
             match_status =

@@ -606,6 +606,75 @@ TEST(cross_channel_same_name_and_transport_links) {
     PASS();
 }
 
+TEST(cross_channel_listener_side_run_keeps_its_edges) {
+    /* A pass wipes the CROSS_* edges of the project it runs from and rebuilds
+     * only what it matches from that project's EMITS.  A consumer-only
+     * service therefore ended each of its own passes with zero channel edges:
+     * the reverse edges a producer's pass had written into it were deleted
+     * and nothing recreated them.  Measured: rcr-ws-server went 8 -> 2. */
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_channel_side(&fixture, "producer", "dynamic_on_air",
+                                              "message_type", "EMITS", "publisher.js") &&
+                 cross_repo_seed_channel_side(&fixture, "consumer", "dynamic_on_air",
+                                              "message_type", "LISTENS_ON", "mounter.ts");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed producer/consumer fixture");
+    }
+
+    const char *consumer = "consumer";
+    cbm_cross_repo_result_t first = cbm_cross_repo_match("producer", &consumer, 1);
+    int consumer_after_producer_run = cross_repo_count_edges(&fixture, "consumer", "CROSS_CHANNEL");
+
+    const char *producer = "producer";
+    cbm_cross_repo_result_t second = cbm_cross_repo_match("consumer", &producer, 1);
+    int consumer_after_own_run = cross_repo_count_edges(&fixture, "consumer", "CROSS_CHANNEL");
+    int producer_after_consumer_run = cross_repo_count_edges(&fixture, "producer", "CROSS_CHANNEL");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(first.failed);
+    ASSERT_FALSE(second.failed);
+    ASSERT_EQ(consumer_after_producer_run, 1);
+    ASSERT_EQ(second.channel_edges, 1);
+    ASSERT_EQ(consumer_after_own_run, 1);
+    ASSERT_EQ(producer_after_consumer_run, 1);
+    PASS();
+}
+
+TEST(cross_channel_ignores_transport_lifecycle_events) {
+    /* Every raw WebSocket client listens on `message`, `close` and `error`,
+     * and every Socket.IO server can emit them; pairing those names links a
+     * service to every socket client in the workspace.  Measured: the only
+     * edge between rcr-ws-server and rooster-public-api was `message`. */
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_channel_side(&fixture, "life-source", "message", "socketio",
+                                              "EMITS", "gateway.ts") &&
+                 cross_repo_seed_channel_side(&fixture, "life-source", "close", "socketio",
+                                              "EMITS", "gateway.ts") &&
+                 cross_repo_seed_channel_side(&fixture, "life-target", "message", "socketio",
+                                              "LISTENS_ON", "client.ts") &&
+                 cross_repo_seed_channel_side(&fixture, "life-target", "close", "socketio",
+                                              "LISTENS_ON", "client.ts");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed lifecycle channel fixture");
+    }
+
+    const char *target = "life-target";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("life-source", &target, 1);
+    int src_edges = cross_repo_count_edges(&fixture, "life-source", "CROSS_CHANNEL");
+    int tgt_edges = cross_repo_count_edges(&fixture, "life-target", "CROSS_CHANNEL");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 0);
+    ASSERT_EQ(src_edges, 0);
+    ASSERT_EQ(tgt_edges, 0);
+    PASS();
+}
+
 TEST(cross_channel_same_name_different_transport_does_not_link) {
     /* The negative invariant: a Socket.IO `message` emitter and a RabbitMQ
      * `message` consumer share nothing but a word.  Zero edges, both sides. */
@@ -752,4 +821,6 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_pre_cancel_preserves_existing_cross_edges);
     RUN_TEST(cross_channel_same_name_and_transport_links);
     RUN_TEST(cross_channel_same_name_different_transport_does_not_link);
+    RUN_TEST(cross_channel_ignores_transport_lifecycle_events);
+    RUN_TEST(cross_channel_listener_side_run_keeps_its_edges);
 }
