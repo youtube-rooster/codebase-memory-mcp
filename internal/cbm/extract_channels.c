@@ -970,6 +970,60 @@ static bool py_is_channel_kwarg(const char *key) {
  * then the dotted source text.  `Exchanges.SENTIMENT_ANALYSIS` is defined in
  * another file, so the text is all we have — and it is enough to match the
  * producer against the consumer that names the same constant. */
+/* True when `value` is `self.<name>` and the class that encloses it defines a
+ * method called <name>: the argument is a bound callback, not a queue. */
+static bool py_self_attr_is_method(CBMExtractCtx *ctx, TSNode value) {
+    if (strcmp(ts_node_type(value), "attribute") != 0) {
+        return false;
+    }
+    TSNode object = ts_node_child_by_field_name(value, TS_FIELD("object"));
+    TSNode attr = ts_node_child_by_field_name(value, TS_FIELD("attribute"));
+    if (ts_node_is_null(object) || ts_node_is_null(attr)) {
+        return false;
+    }
+    char *object_text = cbm_node_text(ctx->arena, object, ctx->source);
+    if (!object_text || strcmp(object_text, "self") != 0) {
+        return false;
+    }
+    char *attr_text = cbm_node_text(ctx->arena, attr, ctx->source);
+    if (!attr_text || !attr_text[0]) {
+        return false;
+    }
+    TSNode cls = ts_node_parent(value);
+    while (!ts_node_is_null(cls) && strcmp(ts_node_type(cls), "class_definition") != 0) {
+        cls = ts_node_parent(cls);
+    }
+    if (ts_node_is_null(cls)) {
+        return false;
+    }
+    TSNode body = ts_node_child_by_field_name(cls, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    uint32_t n = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode stmt = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(stmt), "decorated_definition") == 0) {
+            stmt = ts_node_child_by_field_name(stmt, TS_FIELD("definition"));
+            if (ts_node_is_null(stmt)) {
+                continue;
+            }
+        }
+        if (strcmp(ts_node_type(stmt), "function_definition") != 0) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(stmt, TS_FIELD("name"));
+        if (ts_node_is_null(name)) {
+            continue;
+        }
+        char *name_text = cbm_node_text(ctx->arena, name, ctx->source);
+        if (name_text && strcmp(name_text, attr_text) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *py_value_as_channel(CBMExtractCtx *ctx, TSNode value,
                                        const chan_const_table_t *consts) {
     const char *name = literal_from_arg(ctx, value);
@@ -1095,7 +1149,10 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
          * field, positionally.  Keeping the dotted spelling is what lets the
          * project-wide pass bind it to the literal the subclass configured;
          * dropped here, the consume site has no channel at all. */
-        channel_name = py_value_as_channel(ctx, ts_node_named_child(args, 0), consts);
+        TSNode first = ts_node_named_child(args, 0);
+        if (!py_self_attr_is_method(ctx, first)) {
+            channel_name = py_value_as_channel(ctx, first, consts);
+        }
     }
     if (!channel_name) {
         return;
