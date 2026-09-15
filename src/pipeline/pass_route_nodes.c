@@ -484,7 +484,8 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
      * belongs to the repo and not to the file, and every module sharing a
      * directory inherits every route the directory declares. */
     char hprops[CBM_SZ_512];
-    snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}",
+    snprintf(hprops, sizeof(hprops),
+             "{\"handler\":\"%s\",\"source\":\"decorator\",\"decl_file\":\"%s\"}",
              func->qualified_name ? func->qualified_name : "",
              func->file_path ? func->file_path : "");
     cbm_gbuf_insert_edge(gb, func->id, route_id, "HANDLES", hprops);

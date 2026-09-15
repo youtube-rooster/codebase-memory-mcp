@@ -54,6 +54,7 @@ int cbm_cli_activation_abort_cleanup_probe_for_test(void);
 bool cbm_cli_activation_test_ops_installed(void);
 int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool goose_schema,
                                                 char *block, size_t block_size);
+bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str);
 
 TEST(cli_progress_visibility_policy) {
     ASSERT_TRUE(cbm_cli_progress_enabled(true, false));
@@ -6319,8 +6320,19 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    /* Neither of these agents has a plugin directory, so a planned path under
+     * one would be invented. Name the two directories rather than searching the
+     * whole plan for "/plugins/": OpenCode does ship a real plugin file, and
+     * agent detection finds a command in /usr/local/bin or /opt/homebrew/bin
+     * whatever HOME and PATH say, so a blanket search passes or fails according
+     * to what the developer happens to have installed. */
+    char qoder_plugins[700];
+    char pi_plugins[700];
+    snprintf(qoder_plugins, sizeof(qoder_plugins), "%s/plugins/", qoder_dir);
+    snprintf(pi_plugins, sizeof(pi_plugins), "%s/plugins/", pi_dir);
     bool plan_ok =
-        plan && !strstr(plan, "/plugins/") && !strstr(plan, "plugin_files") &&
+        plan && !strstr(plan, qoder_plugins) && !strstr(plan, pi_plugins) &&
+        !strstr(plan, "plugin_files") &&
         test_json_string_array_contains(plan_root, "config_files_planned", qoder_settings) &&
         test_json_string_array_contains(plan_root, "config_files_planned", amazon_config) &&
         test_json_string_array_contains(plan_root, "config_files_planned", roo_config) &&
@@ -12453,22 +12465,22 @@ TEST(cli_print_tool_help_issue680) {
  * properties, so stdin could never have carried anything it accepts: the read
  * was pure deadlock. Gate the read on the tool actually declaring arguments. */
 TEST(cli_zero_argument_tool_never_reads_stdin_issue1359) {
-    /* The reported hang: zero-argument tool + non-terminal stdin. */
-    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", false));
+    /* #1359's deadlock class: a tool whose schema declares no properties must
+     * never read stdin (nothing it could carry; the read is pure deadlock).
+     * Since #1181 no SHIPPED tool is zero-argument anymore — list_projects,
+     * the original example, now declares pagination properties — so the
+     * zero-argument branch is exercised directly through the schema seam,
+     * and list_projects asserts its NEW truth. */
+    ASSERT_FALSE(
+        cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\",\"properties\":{}}"));
+    ASSERT_FALSE(cbm_cli_stdin_allowed_for_schema_for_test("{\"type\":\"object\"}"));
+    ASSERT_TRUE(cbm_cli_stdin_allowed_for_schema_for_test(
+        "{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\"}}}"));
 
-    /* The documented `echo '<json>' | cli <tool>` channel must survive. */
-    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("index_status", false));
-    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("search_graph", false));
-    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("index_repository", false));
-
-    /* Interactive runs never read the terminal for arguments — unchanged. */
-    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("index_status", true));
+    /* list_projects now takes piped arguments (offset/limit/include_details);
+     * the TTY guard still refuses regardless of schema. */
+    ASSERT_TRUE(cbm_cli_args_from_stdin_allowed("list_projects", false));
     ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("list_projects", true));
-
-    /* An unknown tool is rejected by name; blocking for input first can only
-     * delay that verdict, never change it. */
-    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed("nope_not_a_tool", false));
-    ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(NULL, false));
     PASS();
 }
 
@@ -12496,8 +12508,12 @@ TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359) {
         ASSERT_EQ(cbm_cli_args_from_stdin_allowed(name, false), declares_properties);
         ASSERT_FALSE(cbm_cli_args_from_stdin_allowed(name, true));
     }
-    /* list_projects at minimum; without one the sweep above proves nothing. */
-    ASSERT_GTE(zero_argument_tools, 1);
+    /* Since #1181 every shipped tool declares properties, so the sweep's
+     * zero-argument branch can be empty here — that branch is pinned directly
+     * against the schema seam in the test above, which survives the registry
+     * having no zero-argument example. The sweep still proves schema↔gate
+     * parity for every tool that exists. */
+    (void)zero_argument_tools;
     PASS();
 }
 

@@ -1065,8 +1065,7 @@ static void cbm_pipeline_resolve_symbolic_channels(cbm_gbuf_t *gbuf, CBMFileResu
             char esc_l[CBM_SZ_256];
             cbm_json_escape(esc_l, sizeof(esc_l), literal);
             snprintf(cprops, sizeof(cprops),
-                     "{\"transport\":\"rabbitmq\",\"name\":\"%s\",\"via\":\"class_field\"}",
-                     esc_l);
+                     "{\"transport\":\"rabbitmq\",\"name\":\"%s\",\"via\":\"class_field\"}", esc_l);
             int64_t cid = cbm_gbuf_upsert_node(gbuf, "Channel", literal, cqn, "", 0, 0, cprops);
             for (int sidx = 0; cid > 0 && sidx < nsources; sidx++) {
                 cbm_gbuf_insert_edge(gbuf, sources[sidx], cid, "LISTENS_ON",

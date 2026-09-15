@@ -532,7 +532,8 @@ static const char *js_classify_receiver_depth(CBMExtractCtx *ctx, TSNode object_
      * to it resolved.  A chained call inherits the classification of the handle
      * it was chained onto. */
     enum { JS_RECEIVER_CHAIN_MAX = 4 };
-    if (depth < JS_RECEIVER_CHAIN_MAX && strcmp(ts_node_type(object_node), "call_expression") == 0) {
+    if (depth < JS_RECEIVER_CHAIN_MAX &&
+        strcmp(ts_node_type(object_node), "call_expression") == 0) {
         TSNode fn = ts_node_child_by_field_name(object_node, TS_FIELD("function"));
         if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
             TSNode inner = ts_node_child_by_field_name(fn, TS_FIELD("object"));
@@ -574,9 +575,8 @@ static const char *js_classify_receiver_depth(CBMExtractCtx *ctx, TSNode object_
      * both `conn.channel.sendToQueue(...)` and the common consumer shape where
      * the handle is a field (`this.queue.consume(...)`), so the LISTEN side of
      * every queue was invisible while the EMIT side resolved. */
-    if (strcmp(tail, "channel") == 0 || strcmp(tail, "ch") == 0 ||
-        strcmp(tail, "queue") == 0 || strcmp(tail, "rabbitmq") == 0 ||
-        strcmp(tail, "amqp") == 0 || strcmp(tail, "broker") == 0 ||
+    if (strcmp(tail, "channel") == 0 || strcmp(tail, "ch") == 0 || strcmp(tail, "queue") == 0 ||
+        strcmp(tail, "rabbitmq") == 0 || strcmp(tail, "amqp") == 0 || strcmp(tail, "broker") == 0 ||
         strcmp(tail, "mq") == 0) {
         return "rabbitmq";
     }
@@ -955,7 +955,7 @@ static int py_classify_direction(const char *transport, const char *method) {
 /* Keyword arguments that name a channel, most specific first: `routing_key`
  * is what a consumer binds to, `exchange` only the broker it binds through. */
 static bool py_is_channel_kwarg(const char *key) {
-    static const char *keys[] = {"routing_key", "queue_name", "queue",  "topic",
+    static const char *keys[] = {"routing_key", "queue_name", "queue",   "topic",
                                  "channel",     "event",      "subject", "exchange",
                                  "QueueUrl",    "TopicArn",   NULL};
     for (int i = 0; keys[i]; i++) {
@@ -970,6 +970,60 @@ static bool py_is_channel_kwarg(const char *key) {
  * then the dotted source text.  `Exchanges.SENTIMENT_ANALYSIS` is defined in
  * another file, so the text is all we have — and it is enough to match the
  * producer against the consumer that names the same constant. */
+/* True when `value` is `self.<name>` and the class that encloses it defines a
+ * method called <name>: the argument is a bound callback, not a queue. */
+static bool py_self_attr_is_method(CBMExtractCtx *ctx, TSNode value) {
+    if (strcmp(ts_node_type(value), "attribute") != 0) {
+        return false;
+    }
+    TSNode object = ts_node_child_by_field_name(value, TS_FIELD("object"));
+    TSNode attr = ts_node_child_by_field_name(value, TS_FIELD("attribute"));
+    if (ts_node_is_null(object) || ts_node_is_null(attr)) {
+        return false;
+    }
+    char *object_text = cbm_node_text(ctx->arena, object, ctx->source);
+    if (!object_text || strcmp(object_text, "self") != 0) {
+        return false;
+    }
+    char *attr_text = cbm_node_text(ctx->arena, attr, ctx->source);
+    if (!attr_text || !attr_text[0]) {
+        return false;
+    }
+    TSNode cls = ts_node_parent(value);
+    while (!ts_node_is_null(cls) && strcmp(ts_node_type(cls), "class_definition") != 0) {
+        cls = ts_node_parent(cls);
+    }
+    if (ts_node_is_null(cls)) {
+        return false;
+    }
+    TSNode body = ts_node_child_by_field_name(cls, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    uint32_t n = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode stmt = ts_node_named_child(body, i);
+        if (strcmp(ts_node_type(stmt), "decorated_definition") == 0) {
+            stmt = ts_node_child_by_field_name(stmt, TS_FIELD("definition"));
+            if (ts_node_is_null(stmt)) {
+                continue;
+            }
+        }
+        if (strcmp(ts_node_type(stmt), "function_definition") != 0) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(stmt, TS_FIELD("name"));
+        if (ts_node_is_null(name)) {
+            continue;
+        }
+        char *name_text = cbm_node_text(ctx->arena, name, ctx->source);
+        if (name_text && strcmp(name_text, attr_text) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *py_value_as_channel(CBMExtractCtx *ctx, TSNode value,
                                        const chan_const_table_t *consts) {
     const char *name = literal_from_arg(ctx, value);
@@ -1005,8 +1059,8 @@ static const char *py_value_as_channel(CBMExtractCtx *ctx, TSNode value,
 
 /* Emit one channel per channel-naming keyword argument.  Returns how many. */
 static int py_emit_kwarg_channels(CBMExtractCtx *ctx, TSNode args, const char *transport,
-                                  CBMChannelDirection direction,
-                                  const chan_const_table_t *consts, TSNode call) {
+                                  CBMChannelDirection direction, const chan_const_table_t *consts,
+                                  TSNode call) {
     int emitted = 0;
     uint32_t n = ts_node_named_child_count(args);
     for (uint32_t i = 0; i < n; i++) {
@@ -1095,7 +1149,10 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
          * field, positionally.  Keeping the dotted spelling is what lets the
          * project-wide pass bind it to the literal the subclass configured;
          * dropped here, the consume site has no channel at all. */
-        channel_name = py_value_as_channel(ctx, ts_node_named_child(args, 0), consts);
+        TSNode first = ts_node_named_child(args, 0);
+        if (!py_self_attr_is_method(ctx, first)) {
+            channel_name = py_value_as_channel(ctx, first, consts);
+        }
     }
     if (!channel_name) {
         return;
@@ -1266,7 +1323,8 @@ static void publish_class_attr_bindings(CBMExtractCtx *ctx) {
             if (strcmp(lk, "attribute") == 0) {
                 TSNode obj = ts_node_child_by_field_name(left, TS_FIELD("object"));
                 TSNode att = ts_node_child_by_field_name(left, TS_FIELD("attribute"));
-                char *obj_text = ts_node_is_null(obj) ? NULL : cbm_node_text(ctx->arena, obj, ctx->source);
+                char *obj_text =
+                    ts_node_is_null(obj) ? NULL : cbm_node_text(ctx->arena, obj, ctx->source);
                 if (obj_text && strcmp(obj_text, "self") == 0 && !ts_node_is_null(att)) {
                     target = att;
                     self_attr = true;

@@ -240,8 +240,8 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
                                            the closing brace */
                 char esc_h[CBM_SZ_512];
                 cbm_json_escape(esc_h, sizeof(esc_h), hres.qualified_name);
-                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"decl_file\":\"%s\"}",
-                         esc_h, esc_df);
+                snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"decl_file\":\"%s\"}", esc_h,
+                         esc_df);
                 cbm_gbuf_insert_edge(ctx->gbuf, handler->id, route_id, "HANDLES", hprops);
                 handled = true;
             }
@@ -457,8 +457,8 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         svc = CBM_SVC_ROUTE_REG;
     }
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        if (cbm_pipeline_is_route_registration(call, ctx->registry, ctx->gbuf, module_qn,
-                                               imp_keys, imp_vals, imp_count)) {
+        if (cbm_pipeline_is_route_registration(call, ctx->registry, ctx->gbuf, module_qn, imp_keys,
+                                               imp_vals, imp_count)) {
             handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
             return;
         }
@@ -527,8 +527,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
  * the parallel one, has no branch a mount would fall into. */
 static void calls_record_router_mount(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
-                                      const char **imp_keys, const char **imp_vals,
-                                      int imp_count) {
+                                      const char **imp_keys, const char **imp_vals, int imp_count) {
     if (!source_node || !cbm_pipeline_is_router_mount(call->callee_name)) {
         return;
     }

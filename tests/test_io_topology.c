@@ -246,6 +246,31 @@ TEST(py_worker_subclass_queue_field_is_a_listen) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ * 3b. The callback handed to `consume` is not a queue.  aio-pika style
+ *     clients bind the queue on the receiver (`queue.consume(handler)`),
+ *     so the positional fallback that catches `consume(self.queue_name, …)`
+ *     read the bound method as a channel and reported a worker listening
+ *     on a queue named `self._handle_message`.
+ * ══════════════════════════════════════════════════════════════════ */
+TEST(py_consume_callback_bound_method_is_not_a_channel) {
+    const IoFile f[] = {
+        {"polling_service.py", "class PollingService:\n"
+                               "    def __init__(self, queue_client):\n"
+                               "        self.queue_client = queue_client\n\n"
+                               "    async def start(self):\n"
+                               "        await self.queue_client.consume(self._handle_message)\n\n"
+                               "    async def _handle_message(self, msg):\n"
+                               "        return msg\n"},
+    };
+    IoProj p;
+    ASSERT_TRUE(io_index(&p, f, 1));
+    int phantom = io_query_has(&p, "MATCH (c:Channel) RETURN c.name", "self._handle_message");
+    io_cleanup(&p);
+    ASSERT_TRUE(!phantom);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  * 4. A browser calling an API does not serve one.  A frontend whose
  *    client calls are read as route registrations reports a route
  *    surface it does not have, and the call never reaches the service
@@ -386,6 +411,7 @@ SUITE(io_topology) {
     RUN_TEST(py_route_declared_in_a_test_file_is_not_a_route);
     RUN_TEST(py_class_constant_channel_resolves_to_its_literal);
     RUN_TEST(py_worker_subclass_queue_field_is_a_listen);
+    RUN_TEST(py_consume_callback_bound_method_is_not_a_channel);
     RUN_TEST(js_client_call_in_a_frontend_is_not_a_route);
     RUN_TEST(socketio_envelope_emit_records_the_message_type);
     RUN_TEST(js_room_scoped_socketio_broadcast_is_an_emit);
