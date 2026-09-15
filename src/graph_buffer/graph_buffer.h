@@ -124,6 +124,12 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
                              const char *properties_json);
 
+/* Replace the properties of the (source_id, target_id, type) edge in place,
+ * bypassing the confidence/lexical policy of cbm_gbuf_insert_edge. Returns 1
+ * when the edge exists, 0 otherwise. */
+int cbm_gbuf_set_edge_props(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
+                            const char *properties_json);
+
 /* Find edges from source_id with given type.
  * Sets *out and *count. Caller does NOT free. */
 int cbm_gbuf_find_edges_by_source_type(const cbm_gbuf_t *gb, int64_t source_id, const char *type,

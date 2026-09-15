@@ -237,8 +237,7 @@ TEST(py_worker_subclass_queue_field_is_a_listen) {
     };
     IoProj p;
     ASSERT_TRUE(io_index(&p, f, 3));
-    int ok = io_query_has(&p,
-                          "MATCH ()-[:LISTENS_ON]->(c:Channel) RETURN c.name",
+    int ok = io_query_has(&p, "MATCH ()-[:LISTENS_ON]->(c:Channel) RETURN c.name",
                           "comments.moderation.queue");
     io_cleanup(&p);
     ASSERT_TRUE(ok);
@@ -293,8 +292,8 @@ TEST(js_client_call_in_a_frontend_is_not_a_route) {
      * is the only thing separating a path this repo serves from a path it
      * merely asks for, and reading Route nodes as the served surface is how a
      * frontend reports a route inventory it does not have. */
-    int calls_out = io_query_has(&p, "MATCH ()-[:HTTP_CALLS]->(b) RETURN b.name",
-                                 "/oauth2/providers");
+    int calls_out =
+        io_query_has(&p, "MATCH ()-[:HTTP_CALLS]->(b) RETURN b.name", "/oauth2/providers");
     char *resp = io_query(&p, "MATCH (a)-[:HANDLES]->(b) RETURN b.name");
     int claims_to_serve = resp && strstr(resp, "/oauth2/providers") != NULL;
     if (resp) {
@@ -406,7 +405,161 @@ TEST(cross_repo_socketio_listen_matches_message_type_emit) {
     PASS();
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ * 9. An AMQP publish names an exchange AND a routing key.  Recorded as two
+ *    channels, the exchange has no key and the key has no exchange, and
+ *    the broker's bindings — which route (exchange, key) → queue — can
+ *    never be applied.  The key belongs on the EMITS edge.
+ * ══════════════════════════════════════════════════════════════════ */
+TEST(py_publish_carries_routing_key_on_the_emits_edge) {
+    const IoFile f[] = {
+        {"shared/config.py", "class Exchanges:\n"
+                             "    PROCESSED = \"comments.processed.exchange\"\n\n"
+                             "class RoutingKeys:\n"
+                             "    BATCH = \"comments.batch.processed\"\n"},
+        {"worker/publisher.py",
+         "from shared.config import Exchanges, RoutingKeys\n\n"
+         "async def publish_batch(client, body):\n"
+         "    await client.rabbitmq_client.publish(exchange=Exchanges.PROCESSED, message=body, "
+         "routing_key=RoutingKeys.BATCH)\n\n"
+         "def publish_pika(channel, body):\n"
+         "    channel.basic_publish(exchange=\"comments.processed.exchange\", "
+         "routing_key=\"comments.processed\", body=body)\n\n"
+         "async def publish_aio(exchange, body):\n"
+         "    await exchange.publish(body, routing_key=\"notifications.questions\")\n\n"
+         "async def publish_plain(client, body):\n"
+         "    await client.rabbitmq_client.publish(queue_name=\"all-processed.queue\", "
+         "message=body)\n"},
+    };
+    IoProj p;
+    ASSERT_TRUE(io_index(&p, f, 2));
+    char *names = io_query(&p, "MATCH ()-[:EMITS]->(c:Channel) RETURN c.name");
+    int exchange_is_channel = names && strstr(names, "comments.processed.exchange") != NULL;
+    int key_is_not_a_channel = names && strstr(names, "comments.batch.processed") == NULL &&
+                               strstr(names, "comments.processed\"") == NULL;
+    int aio_key_is_the_channel = names && strstr(names, "notifications.questions") != NULL;
+    int plain_queue_kept = names && strstr(names, "all-processed.queue") != NULL;
+    if (names) {
+        free(names);
+    }
+    char *keys = io_query(&p, "MATCH ()-[e:EMITS]->(c:Channel) RETURN c.name, e.routing_keys");
+    int symbolic_key_resolved = keys && strstr(keys, "comments.batch.processed") != NULL &&
+                                strstr(keys, "RoutingKeys.BATCH") == NULL;
+    /* The array is JSON inside the tool's JSON, so the closing quote of the
+     * key arrives escaped — and it is that backslash which tells the bare key
+     * apart from the `comments.processed.exchange` prefix. */
+    int literal_key_kept = keys && strstr(keys, "comments.processed\\") != NULL;
+    if (keys) {
+        free(keys);
+    }
+    io_cleanup(&p);
+    ASSERT_TRUE(exchange_is_channel);
+    ASSERT_TRUE(key_is_not_a_channel);
+    ASSERT_TRUE(aio_key_is_the_channel);
+    ASSERT_TRUE(plain_queue_kept);
+    ASSERT_TRUE(symbolic_key_resolved);
+    ASSERT_TRUE(literal_key_kept);
+    PASS();
+}
+
+TEST(py_two_keys_on_one_exchange_from_one_function_are_both_kept) {
+    const IoFile f[] = {
+        {"worker/publisher.py", "def publish_both(channel, body):\n"
+                                "    channel.basic_publish(exchange=\"live.control.exchange\", "
+                                "routing_key=\"live.control.start\", body=body)\n"
+                                "    channel.basic_publish(exchange=\"live.control.exchange\", "
+                                "routing_key=\"live.control.stop\", body=body)\n"},
+    };
+    IoProj p;
+    ASSERT_TRUE(io_index(&p, f, 1));
+    char *keys = io_query(&p, "MATCH ()-[e:EMITS]->(c:Channel) RETURN e.routing_keys");
+    int both = keys && strstr(keys, "live.control.start") != NULL &&
+               strstr(keys, "live.control.stop") != NULL;
+    if (keys) {
+        free(keys);
+    }
+    io_cleanup(&p);
+    ASSERT_TRUE(both);
+    PASS();
+}
+
+TEST(js_amqplib_publish_carries_routing_key_on_the_emits_edge) {
+    const IoFile f[] = {
+        {"src/services/rabbitmq.js",
+         "export async function sendNotificationMessage(channel, message) {\n"
+         "  await channel.publish(\"notifications.insights.exchange\", "
+         "\"notifications.highlight_comments\", Buffer.from(JSON.stringify(message)));\n"
+         "}\n\n"
+         "export async function sendDirect(channel, message) {\n"
+         "  await channel.sendToQueue(\"all-processed.queue\", Buffer.from(message));\n"
+         "}\n"},
+    };
+    IoProj p;
+    ASSERT_TRUE(io_index(&p, f, 1));
+    char *rows = io_query(&p, "MATCH ()-[e:EMITS]->(c:Channel) RETURN c.name, e.routing_keys");
+    int exchange_keyed = rows && strstr(rows, "notifications.insights.exchange") != NULL &&
+                         strstr(rows, "notifications.highlight_comments") != NULL;
+    int queue_unkeyed = rows && strstr(rows, "all-processed.queue") != NULL;
+    if (rows) {
+        free(rows);
+    }
+    int key_is_not_a_channel =
+        !io_query_has(&p, "MATCH (c:Channel) RETURN c.name", "notifications.highlight_comments");
+    io_cleanup(&p);
+    ASSERT_TRUE(exchange_keyed);
+    ASSERT_TRUE(queue_unkeyed);
+    ASSERT_TRUE(key_is_not_a_channel);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * 10. The broker definitions file is part of the graph: exchanges and
+ *     queues become Channel nodes and every binding a BINDS edge whose
+ *     routing keys accumulate — ten `notifications.*` keys join one
+ *     exchange to one queue, and the store holds one edge per pair.
+ * ══════════════════════════════════════════════════════════════════ */
+TEST(rabbitmq_definitions_file_becomes_binds_edges) {
+    const IoFile f[] = {
+        {"rabbitmq/definitions.json",
+         "{\"exchanges\": [{\"name\": \"notifications.insights.exchange\"}],\n"
+         " \"queues\": [{\"name\": \"notifications.insights.queue\"}],\n"
+         " \"bindings\": [\n"
+         "  {\"source\": \"notifications.insights.exchange\", \"destination\": "
+         "\"notifications.insights.queue\", \"destination_type\": \"queue\", "
+         "\"routing_key\": \"notifications.questions\"},\n"
+         "  {\"source\": \"notifications.insights.exchange\", \"destination\": "
+         "\"notifications.insights.queue\", \"destination_type\": \"queue\", "
+         "\"routing_key\": \"notifications.hashtags\"}\n"
+         " ]}\n"},
+    };
+    IoProj p;
+    ASSERT_TRUE(io_index(&p, f, 1));
+    char *rows = io_query(
+        &p, "MATCH (e:Channel)-[b:BINDS]->(q:Channel) RETURN e.name, q.name, b.routing_keys");
+    int bound = rows && strstr(rows, "notifications.insights.exchange") != NULL &&
+                strstr(rows, "notifications.insights.queue") != NULL &&
+                strstr(rows, "notifications.questions") != NULL &&
+                strstr(rows, "notifications.hashtags") != NULL;
+    int rows_seen = 0;
+    for (const char *at = rows; at && (at = strstr(at, "notifications.insights.queue")) != NULL;
+         at++) {
+        rows_seen++;
+    }
+    int one_edge = rows_seen == 1;
+    if (rows) {
+        free(rows);
+    }
+    io_cleanup(&p);
+    ASSERT_TRUE(bound);
+    ASSERT_TRUE(one_edge);
+    PASS();
+}
+
 SUITE(io_topology) {
+    RUN_TEST(py_publish_carries_routing_key_on_the_emits_edge);
+    RUN_TEST(py_two_keys_on_one_exchange_from_one_function_are_both_kept);
+    RUN_TEST(js_amqplib_publish_carries_routing_key_on_the_emits_edge);
+    RUN_TEST(rabbitmq_definitions_file_becomes_binds_edges);
     RUN_TEST(py_decorator_route_handles_carries_decl_file);
     RUN_TEST(py_route_declared_in_a_test_file_is_not_a_route);
     RUN_TEST(py_class_constant_channel_resolves_to_its_literal);

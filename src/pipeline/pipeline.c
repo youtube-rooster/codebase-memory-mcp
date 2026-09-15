@@ -914,6 +914,101 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
     cbm_ht_free(denied);
 }
 
+/* Rewrite every symbolic entry of `routing_keys` on edges of `type` to the
+ * literal `bindings` maps it to. Returns how many edges changed. */
+static int cbm_pipeline_resolve_edge_routing_keys(cbm_gbuf_t *gbuf, const char *type,
+                                                  CBMHashTable *bindings) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_type(gbuf, type, &edges, &count) != 0 || count == 0) {
+        return 0;
+    }
+    enum { SYMBOL_CHAIN_MAX = 4 };
+    typedef struct {
+        int64_t source_id;
+        int64_t target_id;
+        char *props;
+    } edge_rewrite_t;
+    edge_rewrite_t *plan = calloc((size_t)count, sizeof(edge_rewrite_t));
+    if (!plan) {
+        return 0;
+    }
+    int planned = 0;
+    for (int i = 0; i < count; i++) {
+        const char *props = edges[i]->properties_json;
+        const char *arr = props ? strstr(props, "\"routing_keys\":[") : NULL;
+        if (!arr) {
+            continue;
+        }
+        arr += strlen("\"routing_keys\":[");
+        const char *close = strchr(arr, ']');
+        if (!close) {
+            continue;
+        }
+        char out[CBM_SZ_4K];
+        int n = snprintf(out, sizeof(out), "%.*s", (int)(arr - props), props);
+        if (n < 0 || (size_t)n >= sizeof(out)) {
+            continue;
+        }
+        bool changed = false;
+        const char *cursor = arr;
+        bool first = true;
+        while (cursor < close) {
+            const char *open_quote = strchr(cursor, '"');
+            if (!open_quote || open_quote >= close) {
+                break;
+            }
+            const char *end_quote = strchr(open_quote + SKIP_ONE, '"');
+            if (!end_quote || end_quote > close) {
+                break;
+            }
+            char symbol[CBM_SZ_256];
+            snprintf(symbol, sizeof(symbol), "%.*s", (int)(end_quote - open_quote - SKIP_ONE),
+                     open_quote + SKIP_ONE);
+            const char *literal = symbol;
+            if (strchr(symbol, '.')) {
+                for (int hop = 0; hop < SYMBOL_CHAIN_MAX; hop++) {
+                    const char *next = (const char *)cbm_ht_get(bindings, literal);
+                    if (!next || !next[0] || next == literal) {
+                        break;
+                    }
+                    literal = next;
+                }
+            }
+            if (literal != symbol && strcmp(literal, symbol) != 0) {
+                changed = true;
+            }
+            char esc[CBM_SZ_256];
+            cbm_json_escape(esc, sizeof(esc), literal);
+            n += snprintf(out + n, sizeof(out) - (size_t)n, "%s\"%s\"", first ? "" : ",", esc);
+            first = false;
+            cursor = end_quote + SKIP_ONE;
+            if ((size_t)n + CBM_SZ_256 >= sizeof(out)) {
+                changed = false;
+                break;
+            }
+        }
+        if (!changed || (size_t)n + strlen(close) >= sizeof(out)) {
+            continue;
+        }
+        snprintf(out + n, sizeof(out) - (size_t)n, "%s", close);
+        plan[planned].source_id = edges[i]->source_id;
+        plan[planned].target_id = edges[i]->target_id;
+        plan[planned].props = strdup(out);
+        planned++;
+    }
+    int rewritten = 0;
+    for (int i = 0; i < planned; i++) {
+        if (plan[i].props && cbm_gbuf_set_edge_props(gbuf, plan[i].source_id, plan[i].target_id,
+                                                     type, plan[i].props)) {
+            rewritten++;
+        }
+        free(plan[i].props);
+    }
+    free(plan);
+    return rewritten;
+}
+
 /* Rename Channel nodes whose name is a symbol (`Queues.ALL_PROCESSED`) to the
  * literal the project binds it to.  The binding is collected from every file,
  * because the constant is declared in a config module and used in workers that
@@ -1029,18 +1124,34 @@ static void cbm_pipeline_resolve_symbolic_channels(cbm_gbuf_t *gbuf, CBMFileResu
     }
     free(plan);
 
+    /* The routing key rides the EMITS edge, and it is spelled the same way the
+     * channel was (`RoutingKeys.NOTIFICATION_QUESTIONS`): resolve it through
+     * the same bindings, or the cross-repo pass looks the symbol up in the
+     * broker's bindings and finds nothing. */
+    renamed += cbm_pipeline_resolve_edge_routing_keys(gbuf, "EMITS", bindings);
+
     /* A base class that consumes `self.<attr>` names a channel it cannot see:
      * the queue is a field the subclass sets.  Bind the two by the field name
-     * and give the consume site an edge to each queue actually configured. */
-    for (int i = 0; i < count; i++) {
+     * and give the consume site an edge to each queue actually configured.
+     * The loop upserts Channel nodes, which reallocates the label index
+     * `nodes` points into, so it walks a snapshot of ids instead. */
+    int64_t *self_ids = count > 0 ? calloc((size_t)count, sizeof(int64_t)) : NULL;
+    int self_count = 0;
+    for (int i = 0; self_ids && i < count; i++) {
         const char *name = nodes[i]->name;
-        if (!name || strncmp(name, "self.", 5) != 0) {
+        if (name && strncmp(name, "self.", 5) == 0) {
+            self_ids[self_count++] = nodes[i]->id;
+        }
+    }
+    for (int i = 0; i < self_count; i++) {
+        const cbm_gbuf_node_t *self_node = cbm_gbuf_find_by_id(gbuf, self_ids[i]);
+        if (!self_node || !self_node->name) {
             continue;
         }
-        const char *attr = name + 5;
+        const char *attr = self_node->name + 5;
         const cbm_gbuf_edge_t **in_edges = NULL;
         int in_count = 0;
-        if (cbm_gbuf_find_edges_by_target_type(gbuf, nodes[i]->id, "LISTENS_ON", &in_edges,
+        if (cbm_gbuf_find_edges_by_target_type(gbuf, self_node->id, "LISTENS_ON", &in_edges,
                                                &in_count) != 0 ||
             in_count == 0) {
             continue;
@@ -1074,6 +1185,7 @@ static void cbm_pipeline_resolve_symbolic_channels(cbm_gbuf_t *gbuf, CBMFileResu
             renamed++;
         }
     }
+    free(self_ids);
     free((void *)binding_keys);
     free((void *)binding_values);
     cbm_ht_free(bindings);

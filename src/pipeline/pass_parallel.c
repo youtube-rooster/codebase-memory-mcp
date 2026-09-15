@@ -1263,50 +1263,6 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
     return count;
 }
 
-/* Find channel source node (enclosing function or file). */
-static const cbm_gbuf_node_t *find_channel_src(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
-                                               const char *rel) {
-    const cbm_gbuf_node_t *node = NULL;
-    if (ch->enclosing_func_qn && ch->enclosing_func_qn[0]) {
-        node = cbm_gbuf_find_by_qn(ctx->gbuf, ch->enclosing_func_qn);
-    }
-    if (!node) {
-        char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-        node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-        free(file_qn);
-    }
-    return node;
-}
-
-/* Create Channel nodes + EMITS/LISTENS_ON edges for one file. */
-static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                 const char *rel) {
-    for (int j = 0; j < result->channels.count; j++) {
-        CBMChannel *ch = &result->channels.items[j];
-        if (!ch->channel_name || !ch->channel_name[0]) {
-            continue;
-        }
-        char channel_qn[CBM_SZ_512];
-        snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s",
-                 ch->transport ? ch->transport : "unknown", ch->channel_name);
-        char esc_cn[CBM_SZ_256];
-        cbm_json_escape(esc_cn, sizeof(esc_cn), ch->channel_name);
-        char channel_props[CBM_SZ_512];
-        snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\",\"name\":\"%s\"}",
-                 ch->transport ? ch->transport : "unknown", esc_cn);
-        int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
-                                                  channel_qn, "", 0, 0, channel_props);
-        const cbm_gbuf_node_t *src_node = find_channel_src(ctx, ch, rel);
-        if (src_node && channel_id > 0) {
-            const char *edge_type = ch->direction == CBM_CHANNEL_EMIT ? "EMITS" : "LISTENS_ON";
-            char edge_props[CBM_SZ_128];
-            snprintf(edge_props, sizeof(edge_props), "{\"transport\":\"%s\"}",
-                     ch->transport ? ch->transport : "unknown");
-            cbm_gbuf_insert_edge(ctx->gbuf, src_node->id, channel_id, edge_type, edge_props);
-        }
-    }
-}
-
 int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count, CBMFileResult **result_cache) {
     cbm_log_info("parallel.registry.start", "files", itoa_log(file_count));
@@ -1347,7 +1303,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
-        create_channel_edges(ctx, result, rel);
+        cbm_pipeline_create_channel_edges_for_file(ctx, result, rel);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
     }
 

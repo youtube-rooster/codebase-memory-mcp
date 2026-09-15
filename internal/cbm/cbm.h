@@ -350,6 +350,8 @@ typedef struct {
 typedef enum {
     CBM_CHANNEL_EMIT = 0,
     CBM_CHANNEL_LISTEN = 1,
+    CBM_CHANNEL_DECLARE = 2, // broker topology names the channel; nobody in this file uses it
+    CBM_CHANNEL_BIND = 3,    // broker topology routes channel_name -> bind_target (BINDS edge)
 } CBMChannelDirection;
 
 typedef struct {
@@ -357,6 +359,8 @@ typedef struct {
     const char *transport;         // "socketio", "event_emitter", ...
     const char *enclosing_func_qn; // QN of the function containing the emit/on call
     CBMChannelDirection direction;
+    const char *routing_key; // AMQP routing key the publish/binding carries, or NULL
+    const char *bind_target; // CBM_CHANNEL_BIND only: the exchange/queue bound to
 } CBMChannel;
 
 // Rust: impl Trait for Struct

@@ -24,6 +24,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "arena.h"
 #include "iris_export_xml.h"
@@ -355,8 +356,6 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     }
 }
 
-/* Create Channel nodes + EMITS / LISTENS_ON edges for one file's channels.
- * Mirrors the parallel path in cbm_build_registry_from_cache — keep in sync. */
 /* Find the source node for a channel edge: enclosing function or file node. */
 static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const CBMChannel *ch,
                                                   const char *rel) {
@@ -372,29 +371,121 @@ static const cbm_gbuf_node_t *find_channel_source(cbm_pipeline_ctx_t *ctx, const
     return node;
 }
 
-static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                          const char *rel) {
+static int64_t upsert_channel_node(cbm_gbuf_t *gbuf, const char *transport, const char *name) {
+    const char *tp = transport ? transport : "unknown";
+    char channel_qn[CBM_SZ_512];
+    snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s", tp, name);
+    char esc[CBM_SZ_256];
+    cbm_json_escape(esc, sizeof(esc), name);
+    char props[CBM_SZ_512];
+    snprintf(props, sizeof(props), "{\"transport\":\"%s\",\"name\":\"%s\"}", tp, esc);
+    return cbm_gbuf_upsert_node(gbuf, "Channel", name, channel_qn, "", 0, 0, props);
+}
+
+/* The buffer and the store both hold one edge per (source, target, type), but
+ * AMQP has one routing key per publish and per binding — ten
+ * `notifications.*` bindings all join the same exchange to the same queue.
+ * The keys therefore accumulate in a `routing_keys` array on that one edge. */
+static void channel_edge_upsert(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id, const char *type,
+                                const char *transport, const char *routing_key) {
+    const char *tp = transport ? transport : "unknown";
+    const char *existing_keys = NULL;
+    size_t existing_len = 0;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    bool exists = false;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, src_id, type, &edges, &edge_count) == 0) {
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i]->target_id != tgt_id) {
+                continue;
+            }
+            exists = true;
+            const char *arr = edges[i]->properties_json
+                                  ? strstr(edges[i]->properties_json, "\"routing_keys\":[")
+                                  : NULL;
+            if (arr) {
+                arr += strlen("\"routing_keys\":[");
+                const char *close = strchr(arr, ']');
+                if (close) {
+                    existing_keys = arr;
+                    existing_len = (size_t)(close - arr);
+                }
+            }
+            break;
+        }
+    }
+    char esc_key[CBM_SZ_256] = {0};
+    if (routing_key && routing_key[0]) {
+        cbm_json_escape(esc_key, sizeof(esc_key), routing_key);
+    }
+    char quoted[CBM_SZ_256 + PAIR_LEN];
+    snprintf(quoted, sizeof(quoted), "\"%s\"", esc_key);
+    bool already_listed = false;
+    if (esc_key[0] && existing_keys) {
+        size_t qlen = strlen(quoted);
+        for (size_t i = 0; i + qlen <= existing_len; i++) {
+            if (memcmp(existing_keys + i, quoted, qlen) == 0) {
+                already_listed = true;
+                break;
+            }
+        }
+    }
+    /* Sized so the accumulated list of one edge always fits: the buffer the
+     * previous round wrote into was this same size, plus one key. */
+    char props[CBM_SZ_4K];
+    size_t n = (size_t)snprintf(props, sizeof(props), "{\"transport\":\"%s\"", tp);
+    if (existing_keys || esc_key[0]) {
+        n += (size_t)snprintf(props + n, sizeof(props) - n, ",\"routing_keys\":[");
+        if (existing_keys && existing_len < sizeof(props) - n) {
+            n += (size_t)snprintf(props + n, sizeof(props) - n, "%.*s", (int)existing_len,
+                                  existing_keys);
+        }
+        if (esc_key[0] && !already_listed && n < sizeof(props)) {
+            n += (size_t)snprintf(props + n, sizeof(props) - n, "%s%s", existing_keys ? "," : "",
+                                  quoted);
+        }
+        if (n < sizeof(props)) {
+            n += (size_t)snprintf(props + n, sizeof(props) - n, "]");
+        }
+    }
+    if (n + PAIR_LEN >= sizeof(props)) {
+        return;
+    }
+    snprintf(props + n, sizeof(props) - n, "}");
+    if (exists) {
+        cbm_gbuf_set_edge_props(gbuf, src_id, tgt_id, type, props);
+    } else {
+        cbm_gbuf_insert_edge(gbuf, src_id, tgt_id, type, props);
+    }
+}
+
+void cbm_pipeline_create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result, const char *rel) {
     for (int j = 0; j < result->channels.count; j++) {
         const CBMChannel *ch = &result->channels.items[j];
         if (!ch->channel_name || !ch->channel_name[0]) {
             continue;
         }
-        char channel_qn[CBM_SZ_512];
-        snprintf(channel_qn, sizeof(channel_qn), "__channel__%s__%s",
-                 ch->transport ? ch->transport : "unknown", ch->channel_name);
-        char channel_props[CBM_SZ_512];
-        snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"%s\",\"name\":\"%s\"}",
-                 ch->transport ? ch->transport : "unknown", ch->channel_name);
-        int64_t channel_id = cbm_gbuf_upsert_node(ctx->gbuf, "Channel", ch->channel_name,
-                                                  channel_qn, "", 0, 0, channel_props);
-
+        int64_t channel_id = upsert_channel_node(ctx->gbuf, ch->transport, ch->channel_name);
+        if (channel_id <= 0 || ch->direction == CBM_CHANNEL_DECLARE) {
+            continue;
+        }
+        if (ch->direction == CBM_CHANNEL_BIND) {
+            if (!ch->bind_target || !ch->bind_target[0]) {
+                continue;
+            }
+            int64_t bound_id = upsert_channel_node(ctx->gbuf, ch->transport, ch->bind_target);
+            if (bound_id > 0) {
+                channel_edge_upsert(ctx->gbuf, channel_id, bound_id, "BINDS", ch->transport,
+                                    ch->routing_key);
+            }
+            continue;
+        }
         const cbm_gbuf_node_t *src_node = find_channel_source(ctx, ch, rel);
-        if (src_node && channel_id > 0) {
+        if (src_node) {
             const char *edge_type = ch->direction == CBM_CHANNEL_EMIT ? "EMITS" : "LISTENS_ON";
-            char edge_props[CBM_SZ_128];
-            snprintf(edge_props, sizeof(edge_props), "{\"transport\":\"%s\"}",
-                     ch->transport ? ch->transport : "unknown");
-            cbm_gbuf_insert_edge(ctx->gbuf, src_node->id, channel_id, edge_type, edge_props);
+            channel_edge_upsert(ctx->gbuf, src_node->id, channel_id, edge_type, ch->transport,
+                                ch->routing_key);
         }
     }
 }
@@ -811,7 +902,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * own defs are now persisted before the lookup. No namespace
              * map is available without the cache (single-file scope). */
             total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
-            create_channel_edges_for_file(ctx, result, rel);
+            cbm_pipeline_create_channel_edges_for_file(ctx, result, rel);
             cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
         }
@@ -844,7 +935,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
             total_imports +=
                 create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
-            create_channel_edges_for_file(ctx, result, files[i].rel_path);
+            cbm_pipeline_create_channel_edges_for_file(ctx, result, files[i].rel_path);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
