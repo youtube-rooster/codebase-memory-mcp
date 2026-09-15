@@ -8,6 +8,7 @@
 #include "store/store.h"
 
 #include <stdatomic.h>
+#include <stdbool.h>
 
 /* Result of a cross-repo matching run. */
 typedef struct {
@@ -41,5 +42,9 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
                                                          const char **target_projects,
                                                          int target_count,
                                                          const atomic_int *cancelled);
+
+/* AMQP topic match: `*` is exactly one dot-delimited word, `#` zero or more.
+ * A pattern without wildcards matches only its exact key. */
+bool cbm_cross_repo_amqp_key_matches(const char *pattern, const char *key);
 
 #endif /* CBM_PASS_CROSS_REPO_H */

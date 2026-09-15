@@ -73,10 +73,9 @@ static bool cross_repo_create_project(const cross_repo_fixture_t *fixture, const
 /* Seed one HTTP_CALLS/HANDLES pair into two exact project stores. The suffix
  * keeps node QNs unique when a source is linked to more than one target. */
 static bool cross_repo_seed_http_pair_files(const cross_repo_fixture_t *fixture,
-                                            const char *source_project,
-                                            const char *target_project, const char *route_path,
-                                            const char *suffix, const char *caller_file,
-                                            const char *handler_file) {
+                                            const char *source_project, const char *target_project,
+                                            const char *route_path, const char *suffix,
+                                            const char *caller_file, const char *handler_file) {
     char source_path[512];
     char target_path[512];
     if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path)) ||
@@ -508,11 +507,11 @@ static bool cross_repo_add_missed_shadow(const cross_repo_fixture_t *fixture, co
  * that never matched in the first place. */
 TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609) {
     cross_repo_fixture_t fixture;
-    bool setup = cross_repo_fixture_begin(&fixture) &&
-                 cross_repo_seed_http_pair(&fixture, "shadow-source", "shadow-target", "/orders",
-                                           "s") &&
-                 cross_repo_add_missed_shadow(&fixture, "shadow-source") &&
-                 cross_repo_add_missed_shadow(&fixture, "shadow-target");
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "shadow-source", "shadow-target", "/orders", "s") &&
+        cross_repo_add_missed_shadow(&fixture, "shadow-source") &&
+        cross_repo_add_missed_shadow(&fixture, "shadow-target");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed shadow-row fixture");
@@ -651,8 +650,8 @@ TEST(cross_channel_ignores_transport_lifecycle_events) {
     bool setup = cross_repo_fixture_begin(&fixture) &&
                  cross_repo_seed_channel_side(&fixture, "life-source", "message", "socketio",
                                               "EMITS", "gateway.ts") &&
-                 cross_repo_seed_channel_side(&fixture, "life-source", "close", "socketio",
-                                              "EMITS", "gateway.ts") &&
+                 cross_repo_seed_channel_side(&fixture, "life-source", "close", "socketio", "EMITS",
+                                              "gateway.ts") &&
                  cross_repo_seed_channel_side(&fixture, "life-target", "message", "socketio",
                                               "LISTENS_ON", "client.ts") &&
                  cross_repo_seed_channel_side(&fixture, "life-target", "close", "socketio",
@@ -710,10 +709,10 @@ TEST(cross_channel_same_name_different_transport_does_not_link) {
  * tests/, 135 of them from the single literal "/tmp/test". */
 TEST(cross_repo_ignores_http_call_declared_in_a_test_file) {
     cross_repo_fixture_t fixture;
-    bool setup = cross_repo_fixture_begin(&fixture) &&
-                 cross_repo_seed_http_pair_files(&fixture, "testfile-source", "testfile-target",
-                                                 "/admin/users", "s", "tests/test_pipeline.c",
-                                                 "server.c");
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair_files(&fixture, "testfile-source", "testfile-target",
+                                        "/admin/users", "s", "tests/test_pipeline.c", "server.c");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed test-file caller fixture");
@@ -734,10 +733,10 @@ TEST(cross_repo_ignores_http_call_declared_in_a_test_file) {
  * not a service endpoint, so no real client can be calling it. */
 TEST(cross_repo_ignores_route_declared_in_a_test_file) {
     cross_repo_fixture_t fixture;
-    bool setup = cross_repo_fixture_begin(&fixture) &&
-                 cross_repo_seed_http_pair_files(&fixture, "testroute-source", "testroute-target",
-                                                 "/admin/users", "s", "client.c",
-                                                 "tests/test_server.c");
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair_files(&fixture, "testroute-source", "testroute-target",
+                                        "/admin/users", "s", "client.c", "tests/test_server.c");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed test-file route fixture");
@@ -786,12 +785,12 @@ TEST(cross_channel_ignores_emitter_in_a_test_file) {
  * that dropped everything cannot pass green. */
 TEST(cross_channel_ignores_listener_in_a_test_file) {
     cross_repo_fixture_t fixture;
-    bool setup = cross_repo_fixture_begin(&fixture) &&
-                 cross_repo_seed_channel_side(&fixture, "chan-tlist-source", "new_comment",
-                                              "message_type", "EMITS", "publish.py") &&
-                 cross_repo_seed_channel_side(&fixture, "chan-tlist-target", "new_comment",
-                                              "message_type", "LISTENS_ON",
-                                              "src/__tests__/consumer.test.ts");
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_channel_side(&fixture, "chan-tlist-source", "new_comment", "message_type",
+                                     "EMITS", "publish.py") &&
+        cross_repo_seed_channel_side(&fixture, "chan-tlist-target", "new_comment", "message_type",
+                                     "LISTENS_ON", "src/__tests__/consumer.test.ts");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed test-file listener fixture");
@@ -803,6 +802,366 @@ TEST(cross_channel_ignores_listener_in_a_test_file) {
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.channel_edges, 0);
+    PASS();
+}
+
+/* ── RabbitMQ bindings: exchange + routing key → queue ──────────── */
+
+/* Like cross_repo_seed_channel_side, with the EMITS/LISTENS_ON edge carrying
+ * the properties the pipeline would have written (`routing_keys`). */
+static bool cross_repo_seed_keyed_channel(const cross_repo_fixture_t *fixture, const char *project,
+                                          const char *channel_name, const char *edge_type,
+                                          const char *edge_props, const char *fn_name,
+                                          const char *fn_file) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store) {
+        return false;
+    }
+    bool ok = cbm_store_upsert_project(store, project, fixture->cache) == CBM_STORE_OK;
+    char fn_qn[256];
+    char channel_qn[256];
+    char channel_props[256];
+    snprintf(fn_qn, sizeof(fn_qn), "%s.%s.%s", project, fn_file, fn_name);
+    snprintf(channel_qn, sizeof(channel_qn), "__channel__rabbitmq__%s", channel_name);
+    snprintf(channel_props, sizeof(channel_props), "{\"transport\":\"rabbitmq\",\"name\":\"%s\"}",
+             channel_name);
+    cbm_node_t fn = {.project = project,
+                     .label = "Function",
+                     .name = fn_name,
+                     .qualified_name = fn_qn,
+                     .file_path = fn_file};
+    cbm_node_t channel = {.project = project,
+                          .label = "Channel",
+                          .name = channel_name,
+                          .qualified_name = channel_qn,
+                          .properties_json = channel_props};
+    int64_t fn_id = ok ? cbm_store_upsert_node(store, &fn) : 0;
+    int64_t channel_id = ok ? cbm_store_upsert_node(store, &channel) : 0;
+    cbm_edge_t edge = {.project = project,
+                       .source_id = fn_id,
+                       .target_id = channel_id,
+                       .type = edge_type,
+                       .properties_json = edge_props};
+    ok = ok && fn_id > 0 && channel_id > 0 && cbm_store_insert_edge(store, &edge) > 0;
+    cbm_store_close(store);
+    return ok;
+}
+
+/* One BINDS edge exchange → destination in the infra project's store, the
+ * shape the definitions.json extractor materializes. */
+static bool cross_repo_seed_binding(const cross_repo_fixture_t *fixture, const char *project,
+                                    const char *exchange, const char *destination,
+                                    const char *routing_keys_json) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store) {
+        return false;
+    }
+    bool ok = cbm_store_upsert_project(store, project, fixture->cache) == CBM_STORE_OK;
+    char ex_qn[256];
+    char ex_props[256];
+    char dest_qn[256];
+    char dest_props[256];
+    char edge_props[1024];
+    snprintf(ex_qn, sizeof(ex_qn), "__channel__rabbitmq__%s", exchange);
+    snprintf(ex_props, sizeof(ex_props), "{\"transport\":\"rabbitmq\",\"name\":\"%s\"}", exchange);
+    snprintf(dest_qn, sizeof(dest_qn), "__channel__rabbitmq__%s", destination);
+    snprintf(dest_props, sizeof(dest_props), "{\"transport\":\"rabbitmq\",\"name\":\"%s\"}",
+             destination);
+    snprintf(edge_props, sizeof(edge_props), "{\"transport\":\"rabbitmq\",\"routing_keys\":%s}",
+             routing_keys_json);
+    cbm_node_t ex = {.project = project,
+                     .label = "Channel",
+                     .name = exchange,
+                     .qualified_name = ex_qn,
+                     .properties_json = ex_props};
+    cbm_node_t dest = {.project = project,
+                       .label = "Channel",
+                       .name = destination,
+                       .qualified_name = dest_qn,
+                       .properties_json = dest_props};
+    int64_t ex_id = ok ? cbm_store_upsert_node(store, &ex) : 0;
+    int64_t dest_id = ok ? cbm_store_upsert_node(store, &dest) : 0;
+    cbm_edge_t edge = {.project = project,
+                       .source_id = ex_id,
+                       .target_id = dest_id,
+                       .type = "BINDS",
+                       .properties_json = edge_props};
+    ok = ok && ex_id > 0 && dest_id > 0 && cbm_store_insert_edge(store, &edge) > 0;
+    cbm_store_close(store);
+    return ok;
+}
+
+/* True when some edge of `edge_type` in `project` has `needle` in its properties. */
+static bool cross_repo_edge_props_have(const cross_repo_fixture_t *fixture, const char *project,
+                                       const char *edge_type, const char *needle) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return false;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(path);
+    if (!store) {
+        return false;
+    }
+    sqlite3_stmt *q = NULL;
+    bool found = false;
+    if (sqlite3_prepare_v2(cbm_store_get_db(store),
+                           "SELECT properties FROM edges WHERE project = ?1 AND type = ?2", -1, &q,
+                           NULL) == SQLITE_OK) {
+        sqlite3_bind_text(q, 1, project, -1, SQLITE_STATIC);
+        sqlite3_bind_text(q, 2, edge_type, -1, SQLITE_STATIC);
+        while (sqlite3_step(q) == SQLITE_ROW) {
+            const char *props = (const char *)sqlite3_column_text(q, 0);
+            if (props && strstr(props, needle)) {
+                found = true;
+                break;
+            }
+        }
+        sqlite3_finalize(q);
+    }
+    cbm_store_close(store);
+    return found;
+}
+
+TEST(cross_channel_resolves_exchange_and_key_through_binding_in_a_third_project) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_keyed_channel(&fixture, "rb-producer",
+                                               "comments.processed.exchange", "EMITS",
+                                               "{\"transport\":\"rabbitmq\","
+                                               "\"routing_keys\":[\"comments.processed\"]}",
+                                               "publish_processed", "worker.py") &&
+                 cross_repo_seed_binding(&fixture, "rb-infra", "comments.processed.exchange",
+                                         "comments.processed.queue", "[\"comments.processed\"]") &&
+                 cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "comments.processed.queue",
+                                               "LISTENS_ON", "{\"transport\":\"rabbitmq\"}",
+                                               "consume_processed", "consumer.js");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed the binding fixture");
+    }
+
+    /* The infra project is not a target: the binding is found anyway. */
+    const char *target = "rb-consumer";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("rb-producer", &target, 1);
+    int producer_edges = cross_repo_count_edges(&fixture, "rb-producer", "CROSS_CHANNEL");
+    int consumer_edges = cross_repo_count_edges(&fixture, "rb-consumer", "CROSS_CHANNEL");
+    int infra_edges = cross_repo_count_edges(&fixture, "rb-infra", "CROSS_CHANNEL");
+    bool via = cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                          "\"via_exchange\":\"comments.processed.exchange\"");
+    bool key = cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                          "\"routing_key\":\"comments.processed\"");
+    bool who = cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                          "\"binding_project\":\"rb-infra\"");
+    bool target_fn = cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                                "\"target_function\":\"consume_processed\"");
+    bool queue_named = cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                                  "\"channel_name\":\"comments.processed.queue\"");
+    bool reverse_props =
+        cross_repo_edge_props_have(&fixture, "rb-consumer", "CROSS_CHANNEL",
+                                   "\"via_exchange\":\"comments.processed.exchange\"");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 1);
+    ASSERT_EQ(producer_edges, 1);
+    ASSERT_EQ(consumer_edges, 1);
+    ASSERT_EQ(infra_edges, 0);
+    ASSERT_TRUE(via);
+    ASSERT_TRUE(key);
+    ASSERT_TRUE(who);
+    ASSERT_TRUE(target_fn);
+    ASSERT_TRUE(queue_named);
+    ASSERT_TRUE(reverse_props);
+    PASS();
+}
+
+TEST(cross_channel_consumer_side_run_resolves_the_binding_too) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-producer", "live.control.exchange", "EMITS",
+                                      "{\"transport\":\"rabbitmq\","
+                                      "\"routing_keys\":[\"live.control.start\"]}",
+                                      "start_live", "control.js") &&
+        cross_repo_seed_binding(&fixture, "rb-infra", "live.control.exchange",
+                                "comments.extraction.control.queue", "[\"live.control.*\"]") &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "comments.extraction.control.queue",
+                                      "LISTENS_ON", "{\"transport\":\"rabbitmq\"}", "register",
+                                      "worker.py");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed the consumer-side fixture");
+    }
+    const char *target = "rb-producer";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("rb-consumer", &target, 1);
+    int producer_edges = cross_repo_count_edges(&fixture, "rb-producer", "CROSS_CHANNEL");
+    int consumer_edges = cross_repo_count_edges(&fixture, "rb-consumer", "CROSS_CHANNEL");
+    cross_repo_fixture_end(&fixture);
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 1);
+    ASSERT_EQ(producer_edges, 1);
+    ASSERT_EQ(consumer_edges, 1);
+    PASS();
+}
+
+TEST(cross_channel_amqp_wildcards_match_words_not_strings) {
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("processed.*", "processed.sentiments"));
+    ASSERT_FALSE(cbm_cross_repo_amqp_key_matches("processed.*", "processed.a.b"));
+    ASSERT_FALSE(cbm_cross_repo_amqp_key_matches("processed.*", "processed"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("live.control.*", "live.control.start"));
+    ASSERT_FALSE(cbm_cross_repo_amqp_key_matches("live.control.*", "live.controls.start"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("#", "anything.at.all"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("#", ""));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("a.#", "a"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("a.#", "a.b.c"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("a.#.z", "a.z"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("a.#.z", "a.b.c.z"));
+    ASSERT_FALSE(cbm_cross_repo_amqp_key_matches("a.#.z", "a.b.c"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("*.*.z", "a.b.z"));
+    ASSERT_FALSE(cbm_cross_repo_amqp_key_matches("*.*.z", "a.z"));
+    ASSERT_TRUE(cbm_cross_repo_amqp_key_matches("comments.processed", "comments.processed"));
+    ASSERT_FALSE(cbm_cross_repo_amqp_key_matches("comments.processed", "comments.processed.x"));
+    ASSERT_FALSE(cbm_cross_repo_amqp_key_matches("comments.processe", "comments.processed"));
+    PASS();
+}
+
+TEST(cross_channel_wildcard_binding_resolves_and_many_keys_yield_one_edge_per_site) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-producer", "workers.processed.exchange",
+                                      "EMITS",
+                                      "{\"transport\":\"rabbitmq\","
+                                      "\"routing_keys\":[\"processed.sentiments\"]}",
+                                      "publish_sentiments", "sentiment.py") &&
+        cross_repo_seed_binding(&fixture, "rb-infra", "workers.processed.exchange",
+                                "all-processed.queue", "[\"processed.*\"]") &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "all-processed.queue", "LISTENS_ON",
+                                      "{\"transport\":\"rabbitmq\"}", "consume_all", "all.js") &&
+        cross_repo_seed_keyed_channel(
+            &fixture, "rb-producer", "notifications.insights.exchange", "EMITS",
+            "{\"transport\":\"rabbitmq\",\"routing_keys\":[\"notifications.trending_topics\","
+            "\"notifications.sentiment_analysis\",\"notifications.highlight_comments\","
+            "\"notifications.people_requests\",\"notifications.questions\","
+            "\"notifications.competitors\",\"notifications.sponsors\",\"notifications.hashtags\","
+            "\"notifications.mini_trendings\",\"notifications.crisis_alert\"]}",
+            "notify", "notify.py") &&
+        cross_repo_seed_binding(
+            &fixture, "rb-infra", "notifications.insights.exchange", "notifications.insights.queue",
+            "[\"notifications.trending_topics\",\"notifications.sentiment_analysis\","
+            "\"notifications.highlight_comments\",\"notifications.people_requests\","
+            "\"notifications.questions\",\"notifications.competitors\","
+            "\"notifications.sponsors\",\"notifications.hashtags\","
+            "\"notifications.mini_trendings\",\"notifications.crisis_alert\"]") &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "notifications.insights.queue",
+                                      "LISTENS_ON", "{\"transport\":\"rabbitmq\"}",
+                                      "consume_notifications", "notifications.js");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed the wildcard fixture");
+    }
+    const char *target = "rb-consumer";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("rb-producer", &target, 1);
+    int producer_edges = cross_repo_count_edges(&fixture, "rb-producer", "CROSS_CHANNEL");
+    int consumer_edges = cross_repo_count_edges(&fixture, "rb-consumer", "CROSS_CHANNEL");
+    bool wildcard_resolved =
+        cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                   "\"channel_name\":\"all-processed.queue\"") &&
+        cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                   "\"routing_key\":\"processed.sentiments\"");
+    bool notifications_resolved =
+        cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                   "\"channel_name\":\"notifications.insights.queue\"");
+    cross_repo_fixture_end(&fixture);
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 2);
+    ASSERT_EQ(producer_edges, 2);
+    ASSERT_EQ(consumer_edges, 2);
+    ASSERT_TRUE(wildcard_resolved);
+    ASSERT_TRUE(notifications_resolved);
+    PASS();
+}
+
+TEST(cross_channel_key_without_binding_produces_no_edge) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        /* Key bound on ANOTHER exchange: the exchange is named, so it scopes. */
+        cross_repo_seed_keyed_channel(&fixture, "rb-producer", "comments.processed.exchange",
+                                      "EMITS",
+                                      "{\"transport\":\"rabbitmq\","
+                                      "\"routing_keys\":[\"processed.sentiments\"]}",
+                                      "publish_wrong_exchange", "a.py") &&
+        /* Key bound nowhere. */
+        cross_repo_seed_keyed_channel(&fixture, "rb-producer", "workers.processed.exchange",
+                                      "EMITS",
+                                      "{\"transport\":\"rabbitmq\","
+                                      "\"routing_keys\":[\"nobody.listens\"]}",
+                                      "publish_unbound_key", "b.py") &&
+        /* Exchange with no bindings at all. */
+        cross_repo_seed_keyed_channel(&fixture, "rb-producer", "egress.exchange", "EMITS",
+                                      "{\"transport\":\"rabbitmq\","
+                                      "\"routing_keys\":[\"content.publish.requested\"]}",
+                                      "publish_unbound_exchange", "c.py") &&
+        cross_repo_seed_binding(&fixture, "rb-infra", "workers.processed.exchange",
+                                "all-processed.queue", "[\"processed.*\"]") &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "all-processed.queue", "LISTENS_ON",
+                                      "{\"transport\":\"rabbitmq\"}", "consume_all", "all.js") &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "egress.publish.queue", "LISTENS_ON",
+                                      "{\"transport\":\"rabbitmq\"}", "consume_egress",
+                                      "egress.js");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed the negative fixture");
+    }
+    const char *target = "rb-consumer";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("rb-producer", &target, 1);
+    int producer_edges = cross_repo_count_edges(&fixture, "rb-producer", "CROSS_CHANNEL");
+    int consumer_edges = cross_repo_count_edges(&fixture, "rb-consumer", "CROSS_CHANNEL");
+    cross_repo_fixture_end(&fixture);
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 0);
+    ASSERT_EQ(producer_edges, 0);
+    ASSERT_EQ(consumer_edges, 0);
+    PASS();
+}
+
+TEST(cross_channel_test_file_listener_does_not_shadow_the_real_one) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-producer", "comments.extraction.control.queue",
+                                      "EMITS", "{\"transport\":\"rabbitmq\"}", "send_control",
+                                      "rabbitmq.js") &&
+        /* Seeded first, so it is the row a LIMIT 1 lookup returns. */
+        cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "comments.extraction.control.queue",
+                                      "LISTENS_ON", "{\"transport\":\"rabbitmq\"}",
+                                      "test_reconnect",
+                                      "shared/tests/test_rabbitmq_reconnect.py") &&
+        cross_repo_seed_keyed_channel(&fixture, "rb-consumer", "comments.extraction.control.queue",
+                                      "LISTENS_ON", "{\"transport\":\"rabbitmq\"}", "register",
+                                      "shared/worker/abstract_worker.py");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed the shadowed listener fixture");
+    }
+    const char *target = "rb-consumer";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("rb-producer", &target, 1);
+    int producer_edges = cross_repo_count_edges(&fixture, "rb-producer", "CROSS_CHANNEL");
+    bool real_listener = cross_repo_edge_props_have(&fixture, "rb-producer", "CROSS_CHANNEL",
+                                                    "\"target_function\":\"register\"");
+    cross_repo_fixture_end(&fixture);
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(producer_edges, 1);
+    ASSERT_TRUE(real_listener);
     PASS();
 }
 
@@ -822,5 +1181,11 @@ SUITE(cross_repo) {
     RUN_TEST(cross_channel_same_name_and_transport_links);
     RUN_TEST(cross_channel_same_name_different_transport_does_not_link);
     RUN_TEST(cross_channel_ignores_transport_lifecycle_events);
+    RUN_TEST(cross_channel_resolves_exchange_and_key_through_binding_in_a_third_project);
+    RUN_TEST(cross_channel_consumer_side_run_resolves_the_binding_too);
+    RUN_TEST(cross_channel_amqp_wildcards_match_words_not_strings);
+    RUN_TEST(cross_channel_wildcard_binding_resolves_and_many_keys_yield_one_edge_per_site);
+    RUN_TEST(cross_channel_key_without_binding_produces_no_edge);
+    RUN_TEST(cross_channel_test_file_listener_does_not_shadow_the_real_one);
     RUN_TEST(cross_channel_listener_side_run_keeps_its_edges);
 }

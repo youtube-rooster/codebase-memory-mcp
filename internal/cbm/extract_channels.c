@@ -480,15 +480,22 @@ static int js_aws_v3_command_channel(CBMExtractCtx *ctx, TSNode call, const char
 
 /* ── Emit helper ─────────────────────────────────────────────────── */
 
-static void push_channel(CBMExtractCtx *ctx, const char *channel_name, const char *transport,
-                         CBMChannelDirection direction, TSNode call) {
+static void push_channel_keyed(CBMExtractCtx *ctx, const char *channel_name, const char *transport,
+                               CBMChannelDirection direction, TSNode call,
+                               const char *routing_key) {
     CBMChannel ch = {
         .channel_name = channel_name,
         .transport = transport,
         .enclosing_func_qn = enclosing_function_qn(ctx, call),
         .direction = direction,
+        .routing_key = routing_key,
     };
     cbm_channels_push(&ctx->result->channels, ctx->arena, ch);
+}
+
+static void push_channel(CBMExtractCtx *ctx, const char *channel_name, const char *transport,
+                         CBMChannelDirection direction, TSNode call) {
+    push_channel_keyed(ctx, channel_name, transport, direction, call, NULL);
 }
 
 /* The message-type namespace: channels routed by a discriminator field inside
@@ -815,7 +822,19 @@ static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
     if (!channel_name) {
         return;
     }
-    push_channel(ctx, channel_name, transport, direction, call);
+    /* amqplib: `channel.publish(exchange, routingKey, content)`.  The exchange
+     * is the channel; the key is what the broker routes on, so it rides the
+     * edge instead of being dropped with the rest of the positional args. */
+    const char *routing_key = NULL;
+    if (direction == CBM_CHANNEL_EMIT && strcmp(transport, "rabbitmq") == 0 && method &&
+        strcmp(method, "publish") == 0 && ts_node_named_child_count(args) > SKIP_ONE) {
+        TSNode second = ts_node_named_child(args, SKIP_ONE);
+        routing_key = literal_from_arg(ctx, second);
+        if (!routing_key) {
+            routing_key = literal_from_first_child(ctx, second);
+        }
+    }
+    push_channel_keyed(ctx, channel_name, transport, direction, call, routing_key);
 }
 
 static void extract_channels_js(CBMExtractCtx *ctx) {
@@ -1062,6 +1081,12 @@ static int py_emit_kwarg_channels(CBMExtractCtx *ctx, TSNode args, const char *t
                                   CBMChannelDirection direction, const chan_const_table_t *consts,
                                   TSNode call) {
     int emitted = 0;
+    /* An AMQP publish names an exchange and a routing key, and the pair is one
+     * act of publishing: the broker resolves the key against the exchange's
+     * bindings.  Recorded as two channels, the exchange node has no key and
+     * the key node has no exchange, and neither can ever be routed. */
+    const char *exchange = NULL;
+    const char *routing_key = NULL;
     uint32_t n = ts_node_named_child_count(args);
     for (uint32_t i = 0; i < n; i++) {
         TSNode arg = ts_node_named_child(args, i);
@@ -1081,7 +1106,28 @@ static int py_emit_kwarg_channels(CBMExtractCtx *ctx, TSNode args, const char *t
         if (!name) {
             continue;
         }
+        if (direction == CBM_CHANNEL_EMIT && strcmp(transport, "rabbitmq") == 0) {
+            if (strcmp(key_text, "exchange") == 0) {
+                exchange = name[0] ? name : NULL;
+                continue;
+            }
+            if (strcmp(key_text, "routing_key") == 0) {
+                routing_key = name;
+                continue;
+            }
+        }
         push_channel(ctx, name, transport, direction, call);
+        emitted++;
+    }
+    if (exchange) {
+        push_channel_keyed(ctx, exchange, transport, direction, call, routing_key);
+        emitted++;
+    } else if (routing_key) {
+        /* aio-pika publishes on an exchange object (`exchange.publish(msg,
+         * routing_key=k)`) whose name lives in whoever built it.  The key is
+         * still the channel's name, and it is also kept as the key so the
+         * cross-repo pass can look it up in the bindings on its own. */
+        push_channel_keyed(ctx, routing_key, transport, direction, call, routing_key);
         emitted++;
     }
     return emitted;
@@ -1867,8 +1913,126 @@ static void extract_channels_rust(CBMExtractCtx *ctx) {
  *  Entry point — language dispatch
  * ══════════════════════════════════════════════════════════════════ */
 
+/* ── RabbitMQ definitions (management export) ─────────────────────
+ *
+ * The exchange→queue binding lives in no service's code: it is broker
+ * configuration, exported as `definitions.json`.  Without it the producer's
+ * exchange and the consumer's queue are two unrelated names.  The file is
+ * recognised by shape — a top-level `bindings` array whose elements carry
+ * `source`, `destination` and `destination_type` — never by its name. */
+
+static const char *json_string_value(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "string") != 0) {
+        return NULL;
+    }
+    char *text = cbm_node_text(ctx->arena, node, ctx->source);
+    return unquote_string(ctx->arena, text);
+}
+
+/* Value of `key` inside a JSON object node, or a null node. */
+static TSNode json_object_get(CBMExtractCtx *ctx, TSNode object, const char *key) {
+    TSNode missing = {0};
+    if (ts_node_is_null(object) || strcmp(ts_node_type(object), "object") != 0) {
+        return missing;
+    }
+    uint32_t n = ts_node_named_child_count(object);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode pair = ts_node_named_child(object, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            continue;
+        }
+        const char *k = json_string_value(ctx, ts_node_child_by_field_name(pair, TS_FIELD("key")));
+        if (k && strcmp(k, key) == 0) {
+            return ts_node_child_by_field_name(pair, TS_FIELD("value"));
+        }
+    }
+    return missing;
+}
+
+static bool json_is_rabbitmq_definitions(CBMExtractCtx *ctx, TSNode root_object) {
+    TSNode bindings = json_object_get(ctx, root_object, "bindings");
+    if (ts_node_is_null(bindings) || strcmp(ts_node_type(bindings), "array") != 0) {
+        return false;
+    }
+    uint32_t n = ts_node_named_child_count(bindings);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode item = ts_node_named_child(bindings, i);
+        if (strcmp(ts_node_type(item), "object") != 0) {
+            return false;
+        }
+        if (ts_node_is_null(json_object_get(ctx, item, "source")) ||
+            ts_node_is_null(json_object_get(ctx, item, "destination")) ||
+            ts_node_is_null(json_object_get(ctx, item, "destination_type"))) {
+            return false;
+        }
+    }
+    return n > 0;
+}
+
+static void push_topology(CBMExtractCtx *ctx, const char *name, CBMChannelDirection direction,
+                          const char *bind_target, const char *routing_key) {
+    CBMChannel ch = {
+        .channel_name = name,
+        .transport = "rabbitmq",
+        .direction = direction,
+        .routing_key = routing_key,
+        .bind_target = bind_target,
+    };
+    cbm_channels_push(&ctx->result->channels, ctx->arena, ch);
+}
+
+static void json_declare_named_entries(CBMExtractCtx *ctx, TSNode root_object, const char *key) {
+    TSNode list = json_object_get(ctx, root_object, key);
+    if (ts_node_is_null(list) || strcmp(ts_node_type(list), "array") != 0) {
+        return;
+    }
+    uint32_t n = ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode item = ts_node_named_child(list, i);
+        const char *name = json_string_value(ctx, json_object_get(ctx, item, "name"));
+        if (name && name[0]) {
+            push_topology(ctx, name, CBM_CHANNEL_DECLARE, NULL, NULL);
+        }
+    }
+}
+
+static void extract_channels_rabbitmq_definitions(CBMExtractCtx *ctx) {
+    TSNode root = ctx->root;
+    if (ts_node_is_null(root) || ts_node_named_child_count(root) == 0) {
+        return;
+    }
+    TSNode object = ts_node_named_child(root, 0);
+    if (!json_is_rabbitmq_definitions(ctx, object)) {
+        return;
+    }
+    json_declare_named_entries(ctx, object, "exchanges");
+    json_declare_named_entries(ctx, object, "queues");
+
+    TSNode bindings = json_object_get(ctx, object, "bindings");
+    uint32_t n = ts_node_named_child_count(bindings);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode item = ts_node_named_child(bindings, i);
+        const char *source = json_string_value(ctx, json_object_get(ctx, item, "source"));
+        const char *dest = json_string_value(ctx, json_object_get(ctx, item, "destination"));
+        const char *dest_type =
+            json_string_value(ctx, json_object_get(ctx, item, "destination_type"));
+        const char *routing_key = json_string_value(ctx, json_object_get(ctx, item, "routing_key"));
+        if (!source || !source[0] || !dest || !dest[0] || !dest_type) {
+            continue;
+        }
+        if (strcmp(dest_type, "queue") != 0 && strcmp(dest_type, "exchange") != 0) {
+            continue;
+        }
+        push_topology(ctx, source, CBM_CHANNEL_BIND, dest,
+                      routing_key && routing_key[0] ? routing_key : NULL);
+    }
+}
+
 void cbm_extract_channels(CBMExtractCtx *ctx) {
     switch (ctx->language) {
+    case CBM_LANG_JSON:
+        extract_channels_rabbitmq_definitions(ctx);
+        break;
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:

@@ -179,6 +179,13 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
 
 /* Materialize CONFIGURES edges from one extracted file's env-access carriers.
  * Shared by sequential definition processing and the parallel cache registry. */
+/* Materialize one file's channel records: Channel nodes plus EMITS /
+ * LISTENS_ON edges from the enclosing function (or the file node), and the
+ * broker-topology BINDS edges a definitions file declares. Shared by the
+ * sequential and the parallel registry paths. */
+void cbm_pipeline_create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result, const char *rel);
+
 int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
                                                 const CBMFileResult *result, const char *rel);
 

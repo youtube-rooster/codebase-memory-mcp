@@ -38,6 +38,7 @@ enum {
     CR_MAX_CACHE_ENTRIES = 16384,
     CR_COL_3 = 3,
     CR_COL_4 = 4,
+    CR_COL_5 = 5,
     CR_SCHEME_SKIP = 3,      /* strlen("://") */
     CR_ROUTE_PREFIX_LEN = 9, /* strlen("__route__") */
     CR_ANY_LEN = 3,          /* strlen("ANY") */
@@ -52,11 +53,31 @@ typedef enum {
     CR_RUN_CANCELLED,
 } cr_run_status_t;
 
+/* One exchange→destination binding read from a BINDS edge, with the project
+ * whose store declared it (the broker definitions live in the infra repo,
+ * never in the producer's or the consumer's). */
+typedef struct {
+    char exchange[CBM_SZ_256];
+    char pattern[CBM_SZ_256];
+    char destination[CBM_SZ_256];
+    char project[CBM_SZ_128];
+} cr_binding_t;
+
+typedef struct {
+    cr_binding_t *items;
+    int count;
+    int cap;
+} cr_binding_table_t;
+
 typedef struct {
     const atomic_int *cancelled;
     bool cancellation_observed;
     bool mutated;
+    const cr_binding_table_t *bindings;
 } cr_run_context_t;
+
+static int collect_all_projects(char ***out, cr_run_context_t *ctx);
+static void free_project_list(char **projects, int count);
 
 static CBM_TLS cbm_cross_repo_after_insert_test_hook_t cr_after_insert_test_hook = NULL;
 static CBM_TLS void *cr_after_insert_test_context = NULL;
@@ -207,7 +228,7 @@ static const char *json_str_prop(const char *json, const char *key, char *buf, s
 static void build_cross_props(char *buf, size_t bufsz, const char *target_project,
                               const char *target_function, const char *target_file,
                               const char *url_or_channel, const char *extra_key,
-                              const char *extra_val) {
+                              const char *extra_val, const char *extra_json) {
     int n = snprintf(buf, bufsz,
                      "{\"target_project\":\"%s\",\"target_function\":\"%s\","
                      "\"target_file\":\"%s\"",
@@ -220,6 +241,9 @@ static void build_cross_props(char *buf, size_t bufsz, const char *target_projec
     if (extra_val && extra_val[0]) {
         n += snprintf(buf + n, bufsz - (size_t)n, ",\"%s\":\"%s\"",
                       extra_key ? "transport" : "method", extra_val);
+    }
+    if (extra_json && extra_json[0]) {
+        n += snprintf(buf + n, bufsz - (size_t)n, ",%s", extra_json);
     }
     snprintf(buf + n, bufsz - (size_t)n, "}");
 }
@@ -544,7 +568,7 @@ static bool emit_cross_route_bidirectional(
     /* Forward: caller → local Route in source DB */
     char fwd[CR_PROPS_BUF];
     build_cross_props(fwd, sizeof(fwd), tgt_project, handler_name, handler_file, url_path,
-                      "url_path", method);
+                      "url_path", method, NULL);
     if (!insert_cross_edge(src_store, src_project, caller_id, local_route_id, edge_type, fwd,
                            ctx)) {
         return false;
@@ -588,7 +612,7 @@ static bool emit_cross_route_bidirectional(
 
     char rev[CR_PROPS_BUF];
     build_cross_props(rev, sizeof(rev), src_project, caller_name, caller_file, url_path, "url_path",
-                      method);
+                      method, NULL);
     return insert_cross_edge(tgt_store, tgt_project, handler_id, tgt_route_id, edge_type, rev, ctx);
 }
 
@@ -769,7 +793,7 @@ static cr_match_result_t match_async_routes(cbm_store_t *src_store, const char *
 
         char edge_props[CR_PROPS_BUF];
         build_cross_props(edge_props, sizeof(edge_props), tgt_project, handler_name, handler_file,
-                          url_path, "url_path", broker);
+                          url_path, "url_path", broker, NULL);
         if (!insert_cross_edge(src_store, src_project, caller_id, route_id, "CROSS_ASYNC_CALLS",
                                edge_props, ctx)) {
             failed = !cr_cancel_requested(ctx);
@@ -795,7 +819,7 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
                                       cbm_store_t *tgt_store, const char *tgt_project,
                                       const char *channel_name, const char *transport,
                                       int64_t emitter_id, int64_t channel_id,
-                                      cr_run_context_t *ctx) {
+                                      const char *extra_json, cr_run_context_t *ctx) {
     if (cr_cancel_requested(ctx)) {
         return CBM_STORE_NOT_FOUND;
     }
@@ -828,7 +852,7 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
                             * joins this equivalence. */
                            "(?3 IN ('socketio','message_type') AND "
                            " coalesce(json_extract(n.properties,'$.transport'),'') IN "
-                           " ('socketio','message_type'))) LIMIT 1",
+                           " ('socketio','message_type'))) ORDER BY e.source_id",
                            CBM_NOT_FOUND, &tq, NULL) != SQLITE_OK) {
         return CBM_STORE_ERR;
     }
@@ -844,23 +868,26 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
     int64_t listener_id = 0;
     char listener_name[CBM_SZ_256] = {0};
     char listener_file[CBM_SZ_512] = {0};
-    int step_rc = sqlite3_step(tq);
-    if (step_rc == SQLITE_ROW) {
+    /* A queue's reconnect test listens on it too; taking the first row would
+     * let that test shadow the worker and report the queue as unconsumed. */
+    int step_rc;
+    while ((step_rc = sqlite3_step(tq)) == SQLITE_ROW) {
+        const char *file = (const char *)sqlite3_column_text(tq, CR_COL_3);
+        if (file && cbm_is_test_path(file)) {
+            continue;
+        }
         tgt_channel_id = sqlite3_column_int64(tq, 0);
         listener_id = sqlite3_column_int64(tq, SKIP_ONE);
         const char *name = (const char *)sqlite3_column_text(tq, PAIR_LEN);
-        const char *file = (const char *)sqlite3_column_text(tq, CR_COL_3);
         snprintf(listener_name, sizeof(listener_name), "%s", name ? name : "");
         snprintf(listener_file, sizeof(listener_file), "%s", file ? file : "");
+        break;
     }
     int finalize_rc = sqlite3_finalize(tq);
     if ((step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) || finalize_rc != SQLITE_OK) {
         return CBM_STORE_ERR;
     }
     if (step_rc == SQLITE_DONE) {
-        return 0;
-    }
-    if (cbm_is_test_path(listener_file)) {
         return 0;
     }
 
@@ -877,7 +904,7 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
     /* Forward edge: emitter → local Channel */
     char fwd[CR_PROPS_BUF];
     build_cross_props(fwd, sizeof(fwd), tgt_project, listener_name, listener_file, channel_name,
-                      "channel_name", transport);
+                      "channel_name", transport, extra_json);
     if (!insert_cross_edge(src_store, src_project, emitter_id, channel_id, "CROSS_CHANNEL", fwd,
                            ctx)) {
         return cr_cancel_requested(ctx) ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
@@ -889,7 +916,7 @@ static int try_match_channel_listener(cbm_store_t *src_store, const char *src_pr
     /* Reverse edge: listener → target Channel */
     char rev[CR_PROPS_BUF];
     build_cross_props(rev, sizeof(rev), src_project, caller_name, caller_file, channel_name,
-                      "channel_name", transport);
+                      "channel_name", transport, extra_json);
     return insert_cross_edge(tgt_store, tgt_project, listener_id, tgt_channel_id, "CROSS_CHANNEL",
                              rev, ctx)
                ? 1
@@ -930,6 +957,276 @@ static bool cr_is_transport_lifecycle_event(const char *name) {
     return false;
 }
 
+/* ── RabbitMQ: resolve (exchange, routing key) through the bindings ──
+ *
+ * A producer publishes to an exchange with a routing key; a consumer reads a
+ * queue.  The two names never coincide — the broker joins them through its
+ * bindings, which are configuration exported from the broker, so they sit in
+ * whichever project indexed that file.  The table is read once per run from
+ * every store and consulted for every rabbitmq EMITS that carries keys. */
+
+/* Iterate the quoted strings of a `routing_keys` array in an edge's
+ * properties. Returns the next key or NULL; `*cursor` advances. */
+static const char *cr_next_routing_key(const char *props, const char **cursor, char *out,
+                                       size_t outsz) {
+    if (!props) {
+        return NULL;
+    }
+    if (!*cursor) {
+        const char *arr = strstr(props, "\"routing_keys\":[");
+        if (!arr) {
+            return NULL;
+        }
+        *cursor = arr + strlen("\"routing_keys\":[");
+    }
+    const char *open_quote = strchr(*cursor, '"');
+    const char *close = strchr(*cursor, ']');
+    if (!open_quote || (close && open_quote > close)) {
+        return NULL;
+    }
+    const char *end_quote = strchr(open_quote + SKIP_ONE, '"');
+    if (!end_quote) {
+        return NULL;
+    }
+    size_t len = (size_t)(end_quote - open_quote - SKIP_ONE);
+    if (len >= outsz) {
+        len = outsz - SKIP_ONE;
+    }
+    memcpy(out, open_quote + SKIP_ONE, len);
+    out[len] = '\0';
+    *cursor = end_quote + SKIP_ONE;
+    return out;
+}
+
+static bool cr_binding_table_push(cr_binding_table_t *tbl, const char *exchange,
+                                  const char *pattern, const char *destination,
+                                  const char *project) {
+    if (tbl->count == tbl->cap) {
+        int cap = tbl->cap ? tbl->cap * PAIR_LEN : CR_INIT_CAP;
+        cr_binding_t *grown = realloc(tbl->items, (size_t)cap * sizeof(cr_binding_t));
+        if (!grown) {
+            return false;
+        }
+        tbl->items = grown;
+        tbl->cap = cap;
+    }
+    cr_binding_t *b = &tbl->items[tbl->count++];
+    snprintf(b->exchange, sizeof(b->exchange), "%s", exchange);
+    snprintf(b->pattern, sizeof(b->pattern), "%s", pattern);
+    snprintf(b->destination, sizeof(b->destination), "%s", destination);
+    snprintf(b->project, sizeof(b->project), "%s", project);
+    return true;
+}
+
+static bool cr_collect_bindings_from(cbm_store_t *store, const char *project,
+                                     cr_binding_table_t *tbl) {
+    struct sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return false;
+    }
+    sqlite3_stmt *q = NULL;
+    if (sqlite3_prepare_v2(db,
+                           "SELECT s.name, t.name, e.properties FROM edges e "
+                           "JOIN nodes s ON s.id = e.source_id "
+                           "JOIN nodes t ON t.id = e.target_id "
+                           "WHERE e.type = 'BINDS' AND e.project = ?1",
+                           CBM_NOT_FOUND, &q, NULL) != SQLITE_OK) {
+        return false;
+    }
+    if (sqlite3_bind_text(q, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC) != SQLITE_OK) {
+        sqlite3_finalize(q);
+        return false;
+    }
+    bool ok = true;
+    while (sqlite3_step(q) == SQLITE_ROW) {
+        const char *exchange = (const char *)sqlite3_column_text(q, 0);
+        const char *dest = (const char *)sqlite3_column_text(q, SKIP_ONE);
+        const char *props = (const char *)sqlite3_column_text(q, PAIR_LEN);
+        if (!exchange || !dest) {
+            continue;
+        }
+        const char *cursor = NULL;
+        char key[CBM_SZ_256];
+        while (cr_next_routing_key(props, &cursor, key, sizeof(key))) {
+            if (!cr_binding_table_push(tbl, exchange, key, dest, project)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    sqlite3_finalize(q);
+    return ok;
+}
+
+/* Every indexed project contributes: the definitions file is in neither of
+ * the two being matched. */
+static void cr_collect_all_bindings(cr_binding_table_t *tbl, cr_run_context_t *ctx) {
+    char **projects = NULL;
+    int n = collect_all_projects(&projects, ctx);
+    for (int i = 0; i < n; i++) {
+        cbm_store_t *store = cr_open_existing_project(projects[i]);
+        if (!store) {
+            continue;
+        }
+        cr_collect_bindings_from(store, projects[i], tbl);
+        cbm_store_close(store);
+    }
+    if (n > 0) {
+        free_project_list(projects, n);
+    }
+}
+
+/* AMQP topic semantics: words are dot-delimited, `*` stands for exactly one
+ * word and `#` for zero or more. A direct binding is the degenerate pattern
+ * with no wildcards, so equality falls out of the same walk. */
+static bool cr_amqp_words_match(const char *pattern, const char *key) {
+    if (!*pattern) {
+        return !*key;
+    }
+    size_t plen = strcspn(pattern, ".");
+    const char *pnext = pattern[plen] ? pattern + plen + SKIP_ONE : pattern + plen;
+    if (plen == SKIP_ONE && pattern[0] == '#') {
+        if (cr_amqp_words_match(pnext, key)) {
+            return true;
+        }
+        const char *k = key;
+        while (*k) {
+            size_t klen = strcspn(k, ".");
+            k = k[klen] ? k + klen + SKIP_ONE : k + klen;
+            if (cr_amqp_words_match(pnext, k)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (!*key) {
+        return false;
+    }
+    size_t klen = strcspn(key, ".");
+    const char *knext = key[klen] ? key + klen + SKIP_ONE : key + klen;
+    if (plen == SKIP_ONE && pattern[0] == '*') {
+        return cr_amqp_words_match(pnext, knext);
+    }
+    if (plen != klen || strncmp(pattern, key, plen) != 0) {
+        return false;
+    }
+    return cr_amqp_words_match(pnext, knext);
+}
+
+bool cbm_cross_repo_amqp_key_matches(const char *pattern, const char *key) {
+    if (!pattern || !key) {
+        return false;
+    }
+    return cr_amqp_words_match(pattern, key);
+}
+
+typedef struct {
+    char queue[CBM_SZ_256];
+    char via_exchange[CBM_SZ_256];
+    char routing_key[CBM_SZ_256];
+    char project[CBM_SZ_128];
+} cr_resolved_queue_t;
+
+enum { CR_RESOLVE_CAP = 64, CR_EXCHANGE_HOPS_MAX = 4 };
+
+static void cr_resolve_push(cr_resolved_queue_t *out, int *count, const cr_binding_t *b,
+                            const char *key) {
+    for (int i = 0; i < *count; i++) {
+        if (strcmp(out[i].queue, b->destination) == 0) {
+            return;
+        }
+    }
+    if (*count >= CR_RESOLVE_CAP) {
+        return;
+    }
+    cr_resolved_queue_t *r = &out[(*count)++];
+    snprintf(r->queue, sizeof(r->queue), "%s", b->destination);
+    snprintf(r->via_exchange, sizeof(r->via_exchange), "%s", b->exchange);
+    snprintf(r->routing_key, sizeof(r->routing_key), "%s", key);
+    snprintf(r->project, sizeof(r->project), "%s", b->project);
+}
+
+static bool cr_is_binding_source(const cr_binding_table_t *tbl, const char *name) {
+    for (int i = 0; i < tbl->count; i++) {
+        if (strcmp(tbl->items[i].exchange, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Queues reached from `exchange` with `key`. An exchange-to-exchange binding
+ * forwards the message under its original key, so the walk continues into the
+ * bound exchange until it lands on a name that binds nothing (a queue). When
+ * `exchange` is NULL the key alone is looked up on every exchange — an
+ * aio-pika publish names its exchange object, not the exchange. */
+static void cr_resolve_queues(const cr_binding_table_t *tbl, const char *exchange, const char *key,
+                              int depth, cr_resolved_queue_t *out, int *count) {
+    if (depth > CR_EXCHANGE_HOPS_MAX) {
+        return;
+    }
+    for (int i = 0; i < tbl->count; i++) {
+        const cr_binding_t *b = &tbl->items[i];
+        if (exchange && strcmp(b->exchange, exchange) != 0) {
+            continue;
+        }
+        if (!cr_amqp_words_match(b->pattern, key)) {
+            continue;
+        }
+        if (cr_is_binding_source(tbl, b->destination)) {
+            cr_resolve_queues(tbl, b->destination, key, depth + SKIP_ONE, out, count);
+        } else {
+            cr_resolve_push(out, count, b, key);
+        }
+    }
+}
+
+/* Cross edges for every queue an EMITS(exchange, routing_keys) reaches through
+ * the bindings, paired with a LISTENS_ON(queue) in the target project. */
+static int cr_match_bound_queues(cbm_store_t *src_store, const char *src_project,
+                                 cbm_store_t *tgt_store, const char *tgt_project,
+                                 const char *channel_name, const char *emit_props,
+                                 int64_t emitter_id, int64_t channel_id, cr_run_context_t *ctx) {
+    const cr_binding_table_t *tbl = ctx->bindings;
+    if (!tbl || tbl->count == 0) {
+        return 0;
+    }
+    cr_resolved_queue_t resolved[CR_RESOLVE_CAP];
+    int resolved_count = 0;
+    const char *cursor = NULL;
+    char key[CBM_SZ_256];
+    while (cr_next_routing_key(emit_props, &cursor, key, sizeof(key))) {
+        const char *exchange = strcmp(channel_name, key) == 0 ? NULL : channel_name;
+        cr_resolve_queues(tbl, exchange, key, 0, resolved, &resolved_count);
+    }
+    int matched = 0;
+    for (int i = 0; i < resolved_count; i++) {
+        char esc_ex[CBM_SZ_256];
+        char esc_key[CBM_SZ_256];
+        char esc_proj[CBM_SZ_128];
+        cbm_json_escape(esc_ex, sizeof(esc_ex), resolved[i].via_exchange);
+        cbm_json_escape(esc_key, sizeof(esc_key), resolved[i].routing_key);
+        cbm_json_escape(esc_proj, sizeof(esc_proj), resolved[i].project);
+        char extra[CBM_SZ_1K];
+        snprintf(extra, sizeof(extra),
+                 "\"via_exchange\":\"%s\",\"routing_key\":\"%s\",\"binding_project\":\"%s\"",
+                 esc_ex, esc_key, esc_proj);
+        int rc = try_match_channel_listener(src_store, src_project, tgt_store, tgt_project,
+                                            resolved[i].queue, "rabbitmq", emitter_id, channel_id,
+                                            extra, ctx);
+        if (rc == CBM_STORE_ERR) {
+            return CBM_STORE_ERR;
+        }
+        if (rc == CBM_STORE_NOT_FOUND && cr_cancel_requested(ctx)) {
+            return CBM_STORE_NOT_FOUND;
+        }
+        if (rc > 0) {
+            matched++;
+        }
+    }
+    return matched;
+}
+
 static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_project,
                                         cbm_store_t *tgt_store, const char *tgt_project,
                                         cr_run_context_t *ctx) {
@@ -941,7 +1238,7 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
     sqlite3_stmt *s = NULL;
     if (sqlite3_prepare_v2(src_db,
                            "SELECT DISTINCT n.id, n.name, n.qualified_name, n.properties, "
-                           "e.source_id FROM nodes n "
+                           "e.source_id, e.properties FROM nodes n "
                            "JOIN edges e ON e.target_id = n.id AND e.type = 'EMITS' "
                            "WHERE n.project = ?1 AND n.label = 'Channel' "
                            "ORDER BY n.id, e.source_id",
@@ -971,19 +1268,34 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
         int64_t channel_id = sqlite3_column_int64(s, 0);
         const char *channel_props = (const char *)sqlite3_column_text(s, CR_COL_3);
         int64_t emitter_id = sqlite3_column_int64(s, CR_COL_4);
+        const char *emit_props = (const char *)sqlite3_column_text(s, CR_COL_5);
 
         char *channel_name_copy = cbm_strdup(channel_name);
-        if (!channel_name_copy) {
+        char *emit_props_copy = emit_props ? cbm_strdup(emit_props) : NULL;
+        if (!channel_name_copy || (emit_props && !emit_props_copy)) {
+            free(channel_name_copy);
+            free(emit_props_copy);
             failed = true;
             break;
         }
         char transport[CBM_SZ_64] = {0};
         json_str_prop(channel_props, "transport", transport, sizeof(transport));
 
-        int matched =
-            try_match_channel_listener(src_store, src_project, tgt_store, tgt_project,
-                                       channel_name_copy, transport, emitter_id, channel_id, ctx);
+        int matched = try_match_channel_listener(src_store, src_project, tgt_store, tgt_project,
+                                                 channel_name_copy, transport, emitter_id,
+                                                 channel_id, NULL, ctx);
+        if (matched != CBM_STORE_ERR && strcmp(transport, "rabbitmq") == 0 && emit_props_copy) {
+            int bound = cr_match_bound_queues(src_store, src_project, tgt_store, tgt_project,
+                                              channel_name_copy, emit_props_copy, emitter_id,
+                                              channel_id, ctx);
+            if (bound == CBM_STORE_ERR) {
+                matched = CBM_STORE_ERR;
+            } else if (bound > 0) {
+                matched = (matched > 0 ? matched : 0) + bound;
+            }
+        }
         free(channel_name_copy);
+        free(emit_props_copy);
         if (matched == CBM_STORE_ERR) {
             failed = true;
             break;
@@ -992,7 +1304,7 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
             break;
         }
         if (matched > 0) {
-            count++;
+            count += matched;
         }
     }
     if (!failed && !cr_cancel_requested(ctx) && scanned < CR_MAX_EDGES && step_rc != SQLITE_DONE) {
@@ -1356,6 +1668,10 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         return result;
     }
 
+    cr_binding_table_t bindings = {0};
+    cr_collect_all_bindings(&bindings, &run);
+    run.bindings = &bindings;
+
     /* Match against each target */
     for (int i = 0; i < resolved_count; i++) {
         if (cr_cancel_requested(&run)) {
@@ -1439,6 +1755,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
     cbm_store_close(src_store);
 
     free_project_list(resolved, resolved_count);
+    free(bindings.items);
 
     struct timespec t1;
     clock_gettime(CLOCK_MONOTONIC, &t1);

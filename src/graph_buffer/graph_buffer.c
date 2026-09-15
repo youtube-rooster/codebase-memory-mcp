@@ -1124,6 +1124,26 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     return id;
 }
 
+int cbm_gbuf_set_edge_props(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
+                            const char *properties_json) {
+    if (!gb || !type || !properties_json) {
+        return 0;
+    }
+    char key[EDGE_KEY_BUF];
+    make_edge_key(key, sizeof(key), source_id, target_id, type, properties_json);
+    cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
+    if (!existing) {
+        return 0;
+    }
+    char *copy = heap_strdup(properties_json);
+    if (!copy) {
+        return 0;
+    }
+    free(existing->properties_json);
+    existing->properties_json = copy;
+    return 1;
+}
+
 int cbm_gbuf_find_edges_by_source_type(const cbm_gbuf_t *gb, int64_t source_id, const char *type,
                                        const cbm_gbuf_edge_t ***out, int *count) {
     if (!gb || !out || !count) {

@@ -1,6 +1,9 @@
 #include "test_framework.h"
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/pipeline_internal.h"
+#include "cbm.h"
+
+#include <string.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -112,7 +115,106 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
     PASS();
 }
 
+/* ── RabbitMQ definitions.json → Channel nodes + BINDS ─────────── */
+
+static const char *RABBIT_DEFS =
+    "{\n"
+    "  \"users\": [{\"name\": \"guest\"}],\n"
+    "  \"exchanges\": [\n"
+    "    {\"name\": \"comments.processed.exchange\", \"type\": \"topic\"},\n"
+    "    {\"name\": \"rcr.dlx\", \"type\": \"direct\"}\n"
+    "  ],\n"
+    "  \"queues\": [\n"
+    "    {\"name\": \"comments.sentiment.analysis.queue\", \"durable\": true},\n"
+    "    {\"name\": \"dlx.queue\", \"durable\": true}\n"
+    "  ],\n"
+    "  \"bindings\": [\n"
+    "    {\"source\": \"comments.processed.exchange\", \"vhost\": \"/\",\n"
+    "     \"destination\": \"comments.sentiment.analysis.queue\",\n"
+    "     \"destination_type\": \"queue\", \"routing_key\": \"comments.batch.processed\"},\n"
+    "    {\"source\": \"comments.processed.exchange\",\n"
+    "     \"destination\": \"rcr.dlx\", \"destination_type\": \"exchange\",\n"
+    "     \"routing_key\": \"#\"},\n"
+    "    {\"source\": \"comments.processed.exchange\",\n"
+    "     \"destination\": \"someone\", \"destination_type\": \"user\",\n"
+    "     \"routing_key\": \"x\"}\n"
+    "  ]\n"
+    "}\n";
+
+static int count_channels(const CBMFileResult *r, CBMChannelDirection direction, const char *name,
+                          const char *bind_target, const char *routing_key) {
+    int n = 0;
+    for (int i = 0; i < r->channels.count; i++) {
+        const CBMChannel *ch = &r->channels.items[i];
+        if (ch->direction != direction || !ch->channel_name ||
+            strcmp(ch->channel_name, name) != 0) {
+            continue;
+        }
+        if (bind_target && (!ch->bind_target || strcmp(ch->bind_target, bind_target) != 0)) {
+            continue;
+        }
+        if (routing_key && (!ch->routing_key || strcmp(ch->routing_key, routing_key) != 0)) {
+            continue;
+        }
+        n++;
+    }
+    return n;
+}
+
+TEST(infrascan_rabbitmq_definitions_declare_exchanges_queues_and_bindings) {
+    CBMFileResult *r = cbm_extract_file(RABBIT_DEFS, (int)strlen(RABBIT_DEFS), CBM_LANG_JSON,
+                                        "infra", "rabbitmq/definitions.json", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_channels(r, CBM_CHANNEL_DECLARE, "comments.processed.exchange", NULL, NULL), 1);
+    ASSERT_EQ(count_channels(r, CBM_CHANNEL_DECLARE, "rcr.dlx", NULL, NULL), 1);
+    ASSERT_EQ(
+        count_channels(r, CBM_CHANNEL_DECLARE, "comments.sentiment.analysis.queue", NULL, NULL), 1);
+    ASSERT_EQ(count_channels(r, CBM_CHANNEL_DECLARE, "dlx.queue", NULL, NULL), 1);
+    ASSERT_EQ(count_channels(r, CBM_CHANNEL_BIND, "comments.processed.exchange",
+                             "comments.sentiment.analysis.queue", "comments.batch.processed"),
+              1);
+    for (int i = 0; i < r->channels.count; i++) {
+        ASSERT_STR_EQ(r->channels.items[i].transport, "rabbitmq");
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(infrascan_rabbitmq_definitions_bind_exchange_to_exchange_and_skip_other_kinds) {
+    CBMFileResult *r = cbm_extract_file(RABBIT_DEFS, (int)strlen(RABBIT_DEFS), CBM_LANG_JSON,
+                                        "infra", "rabbitmq/definitions.json", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_channels(r, CBM_CHANNEL_BIND, "comments.processed.exchange", "rcr.dlx", "#"),
+              1);
+    ASSERT_EQ(count_channels(r, CBM_CHANNEL_BIND, "comments.processed.exchange", "someone", NULL),
+              0);
+    ASSERT_EQ(count_channels(r, CBM_CHANNEL_DECLARE, "someone", NULL, NULL), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(infrascan_json_without_binding_shape_yields_no_channels) {
+    static const char *plain = "{\"bindings\": [{\"name\": \"eth0\", \"address\": \"10.0.0.1\"}],"
+                               " \"queues\": [{\"name\": \"not.a.rabbit.queue\"}]}";
+    CBMFileResult *r = cbm_extract_file(plain, (int)strlen(plain), CBM_LANG_JSON, "infra",
+                                        "config/network.json", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->channels.count, 0);
+    cbm_free_result(r);
+
+    static const char *empty = "{\"bindings\": [], \"exchanges\": [{\"name\": \"e\"}]}";
+    r = cbm_extract_file(empty, (int)strlen(empty), CBM_LANG_JSON, "infra", "x.json", 0, NULL,
+                         NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->channels.count, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(infrascan) {
+    RUN_TEST(infrascan_rabbitmq_definitions_declare_exchanges_queues_and_bindings);
+    RUN_TEST(infrascan_rabbitmq_definitions_bind_exchange_to_exchange_and_skip_other_kinds);
+    RUN_TEST(infrascan_json_without_binding_shape_yields_no_channels);
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
