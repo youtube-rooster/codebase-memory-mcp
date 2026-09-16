@@ -1090,6 +1090,61 @@ TEST(cross_channel_wildcard_binding_resolves_and_many_keys_yield_one_edge_per_si
     PASS();
 }
 
+/* A worker that publishes `notifications.questions` and, three modules
+ * over, consumes `notifications.insights.queue` is one repo talking to
+ * itself through the broker.  The target loop skips self, so the binding
+ * that joins the two ends was never applied and the queue looked
+ * unconsumed.  Only the bound path is walked for self: a name-only match
+ * inside one project would pair every stage's queue with its own consumer
+ * and drown the graph in edges nobody asked for. */
+TEST(cross_channel_same_project_resolves_the_binding_to_its_own_consumer) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_keyed_channel(&fixture, "rb-self", "notifications.questions",
+                                               "EMITS",
+                                               "{\"transport\":\"rabbitmq\","
+                                               "\"routing_keys\":[\"notifications.questions\"]}",
+                                               "publish_questions", "topics/worker.py") &&
+                 cross_repo_seed_binding(&fixture, "rb-infra", "notifications.insights.exchange",
+                                         "notifications.insights.queue",
+                                         "[\"notifications.questions\"]") &&
+                 cross_repo_seed_keyed_channel(&fixture, "rb-self", "notifications.insights.queue",
+                                               "LISTENS_ON", "{\"transport\":\"rabbitmq\"}",
+                                               "consume_insights", "notifications/worker.py") &&
+                 cross_repo_seed_keyed_channel(&fixture, "rb-self", "clusters.processing.queue",
+                                               "EMITS", "{\"transport\":\"rabbitmq\"}",
+                                               "publish_clusters", "topics/worker.py") &&
+                 cross_repo_seed_keyed_channel(&fixture, "rb-self", "clusters.processing.queue",
+                                               "LISTENS_ON", "{\"transport\":\"rabbitmq\"}",
+                                               "consume_clusters", "clusters/worker.py");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed the self-binding fixture");
+    }
+
+    const char *target = "rb-infra";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("rb-self", &target, 1);
+    int self_edges = cross_repo_count_edges(&fixture, "rb-self", "CROSS_CHANNEL");
+    bool via = cross_repo_edge_props_have(&fixture, "rb-self", "CROSS_CHANNEL",
+                                          "\"via_exchange\":\"notifications.insights.exchange\"");
+    bool target_fn = cross_repo_edge_props_have(&fixture, "rb-self", "CROSS_CHANNEL",
+                                                "\"target_function\":\"consume_insights\"");
+    bool same_project = cross_repo_edge_props_have(&fixture, "rb-self", "CROSS_CHANNEL",
+                                                   "\"target_project\":\"rb-self\"");
+    bool name_only_not_paired = !cross_repo_edge_props_have(
+        &fixture, "rb-self", "CROSS_CHANNEL", "\"channel_name\":\"clusters.processing.queue\"");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.channel_edges, 1);
+    ASSERT_EQ(self_edges, 2);
+    ASSERT_TRUE(via);
+    ASSERT_TRUE(target_fn);
+    ASSERT_TRUE(same_project);
+    ASSERT_TRUE(name_only_not_paired);
+    PASS();
+}
+
 TEST(cross_channel_key_without_binding_produces_no_edge) {
     cross_repo_fixture_t fixture;
     bool setup =
@@ -1186,6 +1241,7 @@ SUITE(cross_repo) {
     RUN_TEST(cross_channel_amqp_wildcards_match_words_not_strings);
     RUN_TEST(cross_channel_wildcard_binding_resolves_and_many_keys_yield_one_edge_per_site);
     RUN_TEST(cross_channel_key_without_binding_produces_no_edge);
+    RUN_TEST(cross_channel_same_project_resolves_the_binding_to_its_own_consumer);
     RUN_TEST(cross_channel_test_file_listener_does_not_shadow_the_real_one);
     RUN_TEST(cross_channel_listener_side_run_keeps_its_edges);
 }

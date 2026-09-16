@@ -1227,9 +1227,12 @@ static int cr_match_bound_queues(cbm_store_t *src_store, const char *src_project
     return matched;
 }
 
+/* `bound_only` walks the (exchange, routing key) bindings and nothing else —
+ * the shape a project's own run takes, where a name-only match would pair
+ * every stage's queue with its consumer next door. */
 static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_project,
                                         cbm_store_t *tgt_store, const char *tgt_project,
-                                        cr_run_context_t *ctx) {
+                                        bool bound_only, cr_run_context_t *ctx) {
     struct sqlite3 *src_db = cbm_store_get_db(src_store);
     if (!src_db) {
         return cr_match_finish(ctx, 0, true);
@@ -1281,9 +1284,11 @@ static cr_match_result_t match_channels(cbm_store_t *src_store, const char *src_
         char transport[CBM_SZ_64] = {0};
         json_str_prop(channel_props, "transport", transport, sizeof(transport));
 
-        int matched = try_match_channel_listener(src_store, src_project, tgt_store, tgt_project,
-                                                 channel_name_copy, transport, emitter_id,
-                                                 channel_id, NULL, ctx);
+        int matched = bound_only ? 0
+                                 : try_match_channel_listener(src_store, src_project, tgt_store,
+                                                              tgt_project, channel_name_copy,
+                                                              transport, emitter_id, channel_id,
+                                                              NULL, ctx);
         if (matched != CBM_STORE_ERR && strcmp(transport, "rabbitmq") == 0 && emit_props_copy) {
             int bound = cr_match_bound_queues(src_store, src_project, tgt_store, tgt_project,
                                               channel_name_copy, emit_props_copy, emitter_id,
@@ -1672,8 +1677,23 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
     cr_collect_all_bindings(&bindings, &run);
     run.bindings = &bindings;
 
+    /* A repo that publishes on an exchange and consumes the queue bound to it
+     * is talking to itself through the broker; the target loop below skips
+     * self, so this is the only place that pipe gets an edge. */
+    if (bindings.count > 0) {
+        cr_run_status_t self_status = add_match_count(
+            &result.channel_edges,
+            match_channels(src_store, project, src_store, project, true, &run));
+        if (self_status == CR_RUN_FAILED) {
+            result.failed = true;
+        } else if (self_status == CR_RUN_CANCELLED) {
+            result.cancelled = true;
+            result.partial_results = run.mutated;
+        }
+    }
+
     /* Match against each target */
-    for (int i = 0; i < resolved_count; i++) {
+    for (int i = 0; i < resolved_count && !result.failed && !result.cancelled; i++) {
         if (cr_cancel_requested(&run)) {
             result.cancelled = true;
             result.partial_results = run.mutated;
@@ -1711,14 +1731,14 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         }
         if (match_status == CR_RUN_OK) {
             match_status = add_match_count(
-                &result.channel_edges, match_channels(src_store, project, tgt_store, tgt, &run));
+                &result.channel_edges, match_channels(src_store, project, tgt_store, tgt, false, &run));
         }
         /* Same as the HTTP reverse pass above: a consumer-only service has no
          * EMITS to iterate, so its own run would otherwise end with the
          * reverse edges delete_cross_edges just wiped and nothing to put back. */
         if (match_status == CR_RUN_OK) {
             match_status = add_match_count(
-                &result.channel_edges, match_channels(tgt_store, tgt, src_store, project, &run));
+                &result.channel_edges, match_channels(tgt_store, tgt, src_store, project, false, &run));
         }
         if (match_status == CR_RUN_OK) {
             match_status =
