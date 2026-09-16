@@ -462,6 +462,50 @@ TEST(py_publish_carries_routing_key_on_the_emits_edge) {
     PASS();
 }
 
+/* A worker publishes through a method of its own base class:
+ * `self.publish_notification_insights(routing_key=K, message=m)`.  Inside the
+ * wrapper the key is a bare parameter, so the EMITS edge it produces names
+ * the exchange and no key — and a keyless emit reaches no queue through the
+ * bindings.  The call site is where the key is spelled; it is an emit of
+ * its own, keyed like an aio-pika `exchange.publish(msg, routing_key=K)`. */
+TEST(py_self_publish_wrapper_call_site_carries_the_routing_key) {
+    const IoFile f[] = {
+        {"shared/config.py", "class Exchanges:\n"
+                             "    INSIGHTS = \"notifications.insights.exchange\"\n\n"
+                             "class RoutingKeys:\n"
+                             "    QUESTIONS = \"notifications.questions\"\n"},
+        {"shared/worker.py",
+         "from shared.config import Exchanges\n\n"
+         "class AbstractWorker:\n"
+         "    async def publish_notification_insights(self, routing_key, message):\n"
+         "        await self.state.rabbitmq_client.publish(exchange=Exchanges.INSIGHTS, "
+         "message=message, routing_key=routing_key)\n"},
+        {"workers/questions.py",
+         "from shared.config import RoutingKeys\n"
+         "from shared.worker import AbstractWorker\n\n"
+         "class QuestionsWorker(AbstractWorker):\n"
+         "    async def process(self, job):\n"
+         "        await self.publish_notification_insights(routing_key=RoutingKeys.QUESTIONS, "
+         "message={\"live_id\": job.live_id})\n"
+         "        self.logger.info(\"published\", extra={\"routing_key\": \"not.a.publish\"})\n"},
+    };
+    IoProj p;
+    ASSERT_TRUE(io_index(&p, f, 3));
+    char *keys = io_query(&p, "MATCH ()-[e:EMITS]->(c:Channel) RETURN c.name, e.routing_keys");
+    int wrapper_exchange_kept = keys && strstr(keys, "notifications.insights.exchange") != NULL;
+    int call_site_key_emitted = keys && strstr(keys, "notifications.questions") != NULL &&
+                                strstr(keys, "RoutingKeys.QUESTIONS") == NULL;
+    int logger_not_an_emit = keys && strstr(keys, "not.a.publish") == NULL;
+    if (keys) {
+        free(keys);
+    }
+    io_cleanup(&p);
+    ASSERT_TRUE(wrapper_exchange_kept);
+    ASSERT_TRUE(call_site_key_emitted);
+    ASSERT_TRUE(logger_not_an_emit);
+    PASS();
+}
+
 TEST(py_two_keys_on_one_exchange_from_one_function_are_both_kept) {
     const IoFile f[] = {
         {"worker/publisher.py", "def publish_both(channel, body):\n"
@@ -557,6 +601,7 @@ TEST(rabbitmq_definitions_file_becomes_binds_edges) {
 
 SUITE(io_topology) {
     RUN_TEST(py_publish_carries_routing_key_on_the_emits_edge);
+    RUN_TEST(py_self_publish_wrapper_call_site_carries_the_routing_key);
     RUN_TEST(py_two_keys_on_one_exchange_from_one_function_are_both_kept);
     RUN_TEST(js_amqplib_publish_carries_routing_key_on_the_emits_edge);
     RUN_TEST(rabbitmq_definitions_file_becomes_binds_edges);

@@ -1133,6 +1133,25 @@ static int py_emit_kwarg_channels(CBMExtractCtx *ctx, TSNode args, const char *t
     return emitted;
 }
 
+static bool py_has_kwarg(CBMExtractCtx *ctx, TSNode args, const char *name) {
+    uint32_t n = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (strcmp(ts_node_type(arg), "keyword_argument") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(arg, TS_FIELD("name"));
+        if (ts_node_is_null(key)) {
+            continue;
+        }
+        char *key_text = cbm_node_text(ctx->arena, key, ctx->source);
+        if (key_text && strcmp(key_text, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_table_t *consts) {
     /* Python call: attribute { object, attribute }, argument_list */
     TSNode func = ts_node_child_by_field_name(call, TS_FIELD("function"));
@@ -1154,6 +1173,10 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
     if (!method) {
         return;
     }
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return;
+    }
     /* An unrecognised receiver still names a broker when the method only makes
      * sense on one.  Deliberately narrow: `send_message` is left out because
      * plenty of non-broker services have one. */
@@ -1161,11 +1184,20 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
                        strcmp(method, "consume") == 0 || strcmp(method, "basic_consume") == 0)) {
         transport = "rabbitmq";
     }
+    /* `self.publish_notification_insights(routing_key=K, message=m)`: a
+     * publish wrapper of the worker's own class.  Inside the wrapper the key is
+     * a bare parameter and the emit it records has no key; the call site is
+     * the only place the key is spelled, so it is an emit of its own. */
+    bool wrapper_publish = !transport && strstr(method, "publish") != NULL &&
+                           py_has_kwarg(ctx, args, "routing_key");
+    if (wrapper_publish) {
+        transport = "rabbitmq";
+    }
     if (!transport) {
         return;
     }
 
-    int dir = py_classify_direction(transport, method);
+    int dir = wrapper_publish ? CBM_CHANNEL_EMIT : py_classify_direction(transport, method);
     if (dir == CHAN_DIR_UNKNOWN) {
         return;
     }
@@ -1182,10 +1214,6 @@ static void py_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
         transport = CHAN_MSGTYPE_TRANSPORT;
     }
 
-    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
-    if (ts_node_is_null(args)) {
-        return;
-    }
     if (py_emit_kwarg_channels(ctx, args, transport, direction, consts, call) > 0) {
         return;
     }
